@@ -4,6 +4,23 @@
 #ifndef REDIS_COMMON_H
 #define REDIS_COMMON_H
 
+/* PHP 8.6+ compatibility shims: legacy macros removed upstream. */
+#ifndef INI_STR
+# define INI_STR(name) ((char *) zend_ini_string((name), sizeof(name) - 1, 0))
+#endif
+#ifndef INI_INT
+# define INI_INT(name) zend_ini_long((name), sizeof(name) - 1, 0)
+#endif
+#ifndef INI_FLT
+# define INI_FLT(name) zend_ini_double((name), sizeof(name) - 1, 0)
+#endif
+#ifndef INI_BOOL
+# define INI_BOOL(name) ((bool) INI_INT(name))
+#endif
+#ifndef EMPTY_SWITCH_DEFAULT_CASE
+# define EMPTY_SWITCH_DEFAULT_CASE() default: ZEND_UNREACHABLE(); break;
+#endif
+
 #define PHPREDIS_CTX_PTR ((char *)0xDEADC0DE)
 #define PHPREDIS_NOTUSED(v) ((void)v)
 
