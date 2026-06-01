@@ -33,6 +33,9 @@
 #ifndef XtOffsetOf
 # define XtOffsetOf(type, field) offsetof(type, field)
 #endif
+#ifndef XtOffsetOf
+# define XtOffsetOf(type, field) offsetof(type, field)
+#endif
 #define PHPREDIS_GET_OBJECT(class_entry, o) (class_entry *)((char *)o - XtOffsetOf(class_entry, std))
 #define PHPREDIS_ZVAL_GET_OBJECT(class_entry, z) PHPREDIS_GET_OBJECT(class_entry, Z_OBJ_P(z))
 
