@@ -35,6 +35,32 @@ typedef struct {
 	bool         has_coro_callback;     /* registered with the coroutine event */
 } redis_pool_binding_t;
 
+/*
+ * One in-flight multiplexed command: a Future the sending coroutine awaits,
+ * resolved by the reply pump with the framed reply. Linked in the lane's FIFO
+ * so reply order (the Redis wire guarantee) maps to waiter order.
+ */
+typedef struct _redis_mux_waiter {
+	zend_future_t            *future;   /* awaitable; resolved with the framed reply */
+	struct _redis_mux_waiter *next;
+} redis_mux_waiter_t;
+
+/*
+ * One multiplex lane: a shared physical connection carrying many coroutines'
+ * stateless commands with an in-order pending-reply FIFO. Created lazily on
+ * first use.
+ */
+typedef struct _redis_mux {
+	redis_async_pool *pool;             /* owning pool (lane context for the pump) */
+	RedisSock        *sock;             /* shared physical connection */
+	redis_mux_waiter_t *head, *tail;    /* in-flight FIFO; order == reply order */
+	uint32_t          in_flight;        /* queue depth: lane selection + backpressure */
+	zend_async_poll_event_t *read_ev;   /* READABLE; armed while in_flight > 0 */
+	zend_async_poll_event_t *write_ev;  /* WRITABLE; armed only while out_buf has bytes */
+	smart_string      out_buf;          /* pending outbound bytes (batched) */
+	smart_string      in_buf;           /* inbound bytes awaiting framing */
+} redis_mux_t;
+
 struct _redis_async_pool {
 	zend_async_pool_t *async_pool;      /* physical RedisSock resources */
 	HashTable         *bindings;        /* coro_key -> redis_pool_binding_t* */
@@ -42,6 +68,8 @@ struct _redis_async_pool {
 	zend_object       *wrapper;         /* cached getPool() wrapper, released on destroy */
 	long               db_default;      /* configured DB; drift pins the conn */
 	uint32_t           mux_reserve;     /* connections reserved for multiplexing */
+	redis_mux_t      **lanes;           /* mux lanes (NULL slot = not yet created) */
+	uint32_t           lane_count;      /* number of lanes (== configured mux) */
 };
 
 /* Stable hash key for the current coroutine (zend_object handle when available,
@@ -276,6 +304,31 @@ static void redis_pool_free_conn(RedisSock *sock)
 	redis_free_socket(sock);
 }
 
+/* Tear down a multiplex lane: stop poll events, drop the connection, free
+ * buffers. The in-flight FIFO is expected to be empty by this point (the
+ * command flow fails pending waiters before teardown). */
+static void redis_mux_lane_free(redis_mux_t *lane)
+{
+	if (lane == NULL) {
+		return;
+	}
+
+	if (lane->read_ev != NULL) {
+		lane->read_ev->base.stop(&lane->read_ev->base);
+		lane->read_ev->base.dispose(&lane->read_ev->base);
+	}
+
+	if (lane->write_ev != NULL) {
+		lane->write_ev->base.stop(&lane->write_ev->base);
+		lane->write_ev->base.dispose(&lane->write_ev->base);
+	}
+
+	smart_string_free(&lane->out_buf);
+	smart_string_free(&lane->in_buf);
+	redis_pool_free_conn(lane->sock);
+	efree(lane);
+}
+
 /*
  * Pool resource handlers
  */
@@ -489,6 +542,11 @@ int redis_pool_create(redis_object *redis, HashTable *opts)
 	rp->db_default = redis->sock ? redis->sock->dbNumber : 0;
 	rp->mux_reserve = (uint32_t)mux;
 
+	if (mux > 0) {
+		rp->lane_count = (uint32_t)mux;
+		rp->lanes = ecalloc(rp->lane_count, sizeof(redis_mux_t *));
+	}
+
 	redis->pool = rp;
 	return SUCCESS;
 }
@@ -523,6 +581,14 @@ void redis_pool_destroy(redis_object *redis)
 		zend_hash_destroy(rp->bindings);
 		efree(rp->bindings);
 		rp->bindings = NULL;
+	}
+
+	if (rp->lanes != NULL) {
+		for (uint32_t i = 0; i < rp->lane_count; i++) {
+			redis_mux_lane_free(rp->lanes[i]);
+		}
+		efree(rp->lanes);
+		rp->lanes = NULL;
 	}
 
 	if (rp->wrapper != NULL) {

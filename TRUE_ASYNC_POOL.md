@@ -263,19 +263,24 @@ No coroutine is spent blocking on the read; no extra context switches.
 
 ### 5.1 The pieces
 
-Per multiplexed socket (`redis_mux_t`):
+Per multiplexed lane (`redis_mux_t`):
 
 - `RedisSock *sock` — the shared physical connection.
-- **A waiter ring buffer** — the FIFO of in-flight requests. Use the existing
-  `zend_async_channel_t` (`ZEND_ASYNC_NEW_CHANNEL`): it *is* a ring buffer, and
-  pushing into it gives a ready-made trigger to pump. Each waiter holds
-  `{ awaitable event, resp_cb, ctx }`.
+- **An in-flight waiter FIFO** — a plain intrusive list (`head`/`tail`, `next`),
+  not a channel. Each waiter is a `zend_future_t` the sending coroutine awaits;
+  the pump resolves it (`ZEND_FUTURE_COMPLETE`) with the framed reply. A Future
+  already inherits an event and carries a result/exception, so it handles
+  waker + result delivery + cancellation — no hand-rolled event or per-command
+  `resp_cb`/`ctx` (those stay on the suspended coroutine's own stack). The list
+  order is the reply-match order; per-command `emalloc` (ring-buffer slot reuse
+  is a deferred optimization).
 - `zend_async_poll_event_t *read_ev` — a READABLE poll event on the socket FD
-  (`ZEND_ASYNC_NEW_SOCKET_EVENT(fd, ASYNC_READABLE)`), started lazily while the
-  FIFO is non-empty, stopped when it drains.
-- A parse buffer for partial RESP frames split across reads.
-- A write baton / out-buffer to serialize concurrent writes (and optionally
-  batch frames before flush → pipelining).
+  (`ZEND_ASYNC_NEW_SOCKET_EVENT(fd, ASYNC_READABLE)`), armed while `in_flight > 0`,
+  stopped when the FIFO drains.
+- `zend_async_poll_event_t *write_ev` — a WRITABLE poll event, armed only while
+  `out_buf` holds unsent bytes (avoids a writable-busy-loop).
+- `smart_string in_buf` — inbound bytes awaiting framing (partial RESP frames).
+- `smart_string out_buf` — pending outbound bytes (batched writes → pipelining).
 
 There are `mux` lanes (default small; 2 is a practical ceiling). A command is
 assigned to the lane with the fewest in-flight replies (`argmin(in_flight)`,
@@ -410,8 +415,9 @@ pool, released on destroy.
 - [x] `redis_cmd_is_multiplexable` classifier (command name parsed from RESP bytes).
 - [x] RESP frame-boundary scanner (`redis_resp_frame_len`; RESP2/RESP3, nesting,
       attributes, partial-frame safe; unit-tested across 21 cases).
-- [ ] `redis_mux_t` lanes: out-buffer, waiter FIFO, in-flight counter,
-      READABLE/WRITABLE poll events; `argmin(in_flight)` lane selection.
+- [x] `redis_mux_t` lane struct + waiter (a `zend_future_t`) + lane array on the
+      pool + lifecycle (lazy slots, teardown). ASAN-clean construct/destroy.
+- [ ] Lazy lane open + `argmin(in_flight)` selection.
 - [ ] Reply pump: recv + frame + FIFO pop + `ZEND_ASYNC_CALLBACKS_NOTIFY`.
 - [ ] Coroutine-side materialization via memory-stream + atomic `resp_cb`.
 - [ ] Write path: optimistic non-blocking write + WRITABLE drain + batching.
