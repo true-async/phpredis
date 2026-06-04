@@ -39,6 +39,7 @@ struct _redis_async_pool {
 	zend_async_pool_t *async_pool;      /* physical RedisSock resources */
 	HashTable         *bindings;        /* coro_key -> redis_pool_binding_t* */
 	HashTable         *opts;            /* dup'd ctor options; factory re-applies */
+	zend_object       *wrapper;         /* cached getPool() wrapper, released on destroy */
 	long               db_default;      /* configured DB; drift pins the conn */
 	uint32_t           mux_reserve;     /* connections reserved for multiplexing */
 };
@@ -336,6 +337,11 @@ void redis_pool_destroy(redis_object *redis)
 		rp->bindings = NULL;
 	}
 
+	if (rp->wrapper != NULL) {
+		OBJ_RELEASE(rp->wrapper);
+		rp->wrapper = NULL;
+	}
+
 	if (rp->async_pool != NULL) {
 		ZEND_ASYNC_POOL_CLOSE(rp->async_pool);
 		ZEND_ASYNC_EVENT_RELEASE(&rp->async_pool->event);
@@ -434,4 +440,19 @@ void redis_pool_maybe_release(zval *id)
 	ZVAL_PTR(&conn_zval, binding->conn);
 	ZEND_ASYNC_POOL_RELEASE(rp->async_pool, &conn_zval);
 	binding->conn = NULL;
+}
+
+zend_object *redis_pool_get_wrapper(redis_object *redis)
+{
+	redis_async_pool *rp = redis->pool;
+
+	if (rp == NULL) {
+		return NULL;
+	}
+
+	if (rp->wrapper == NULL) {
+		rp->wrapper = ZEND_ASYNC_NEW_POOL_OBJ(rp->async_pool);
+	}
+
+	return rp->wrapper;
 }

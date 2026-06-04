@@ -22,6 +22,12 @@ int redis_pool_create(redis_object *redis, HashTable *opts);
 /* Tear down the pool: release active conns, detach bindings, close async pool. */
 void redis_pool_destroy(redis_object *redis);
 
+/* Lazily create and cache the PHP pool wrapper object (Async\Pool) for
+ * Redis::getPool(). Returns NULL when the object has no pool. The returned
+ * object is owned by the pool (released on destroy); callers that hand it to
+ * userland must GC_ADDREF it. */
+zend_object *redis_pool_get_wrapper(redis_object *redis);
+
 /*
  * Per-coroutine checkout. Returns a READY RedisSock or NULL on failure
  * (throws unless no_throw). Reuses the coroutine's pinned connection when one

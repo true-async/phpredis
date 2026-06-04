@@ -620,6 +620,14 @@ class Redis {
     public function __destruct();
 
     /**
+     * Return the TrueAsync connection pool wrapper for this instance,
+     * or null when pooling is disabled.
+     *
+     * @return Async\Pool|null
+     */
+    public function getPool(): ?\Async\Pool {}
+
+    /**
      * Compress a value with the currently configured compressor (Redis::OPT_COMPRESSION)
      * exactly the same way PhpRedis does before sending data to Redis.
      *

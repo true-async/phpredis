@@ -113,6 +113,7 @@ struct _redis_async_pool {
     zend_async_pool_t *async_pool;      /* physical RedisSock resources */
     HashTable         *bindings;        /* coro_key -> redis_pool_binding_t* */
     HashTable         *opts;            /* dup'd ctor options; factory replays */
+    zend_object       *wrapper;         /* cached getPool() wrapper, released on destroy */
     long               db_default;      /* configured DB; drift pins the conn */
     uint32_t           mux_reserve;     /* connections reserved for multiplexing */
 };
@@ -357,8 +358,10 @@ Async\spawn(function () use ($redis) {    // checkout: the transaction pins a co
 });
 ```
 
-Optional `$redis->getPool()` → a PHP wrapper for introspection
-(count/idle/active), like `PDO::getPool()`. (Not yet implemented.)
+`$redis->getPool()` → the `Async\Pool` wrapper for introspection
+(`count()` / `idleCount()` / `activeCount()`), like `PDO::getPool()`; returns
+`null` when pooling is disabled. The wrapper is created lazily and cached on the
+pool, released on destroy.
 
 ---
 
@@ -372,8 +375,9 @@ Optional `$redis->getPool()` → a PHP wrapper for introspection
 - [x] `redis_pool_acquire_conn` / `redis_pool_maybe_release` / on-finish callback.
 - [x] `redis_sock_get` pool-aware; `redis_process_cmd`/`_kw_cmd` tail release.
 - [x] `redis_conn_is_pinned` (MULTI/PIPELINE/WATCH/SUB/SELECT).
-- [x] Tests `tests/async/` (single, concurrent, transaction pin, MULTI isolation).
-- [ ] `getPool()` wrapper (introspection; tests 001/004 wait on it).
+- [x] `getPool()` wrapper (`Async\Pool` introspection; null without a pool).
+- [x] Tests `tests/async/` (construct, single, concurrent, backpressure,
+      transaction pin, MULTI isolation, getPool introspection) — all green.
 
 ### Stage 2 — multiplex queue
 - [ ] `redis_cmd_is_multiplexable` classifier.
@@ -395,9 +399,8 @@ Optional `$redis->getPool()` → a PHP wrapper for introspection
 Chaos-style invariants (true under any interleaving — count attempts/successes,
 not exact values).
 
-Current: 002 (single), 003 (concurrent), 005 (transaction pin), 006 (concurrent
-MULTI isolation) pass. 001 (construct introspection) and 004 (backpressure
-observability) need `getPool()`.
+Current: 001–007 all pass — construct introspection, single, concurrent,
+backpressure, transaction pin, concurrent-MULTI isolation, getPool introspection.
 
 Planned Stage 2: mux many GET over one socket, reply ordering under interleaving,
 fallback for MULTI/SUB/BLPOP, broken mux socket, implicit pipelining.

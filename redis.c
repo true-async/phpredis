@@ -531,6 +531,22 @@ PHP_METHOD(Redis,__destruct) {
     }
 }
 
+/* {{{ proto ?Async\Pool Redis::getPool()
+    Return the connection pool wrapper, or null when pooling is disabled. */
+PHP_METHOD(Redis, getPool)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    redis_object *redis = PHPREDIS_ZVAL_GET_OBJECT(redis_object, getThis());
+    zend_object *pool_obj = redis_pool_get_wrapper(redis);
+    if (pool_obj == NULL) {
+        RETURN_NULL();
+    }
+
+    GC_ADDREF(pool_obj);
+    RETURN_OBJ(pool_obj);
+}
+
 /* {{{ proto boolean Redis::connect(string host, int port [, double timeout [, long retry_interval]])
  */
 PHP_METHOD(Redis, connect)
