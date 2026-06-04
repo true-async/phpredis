@@ -1,0 +1,41 @@
+/*
+  TrueAsync connection pool for phpredis.
+  See TRUE_ASYNC_POOL.md for the design and algorithm.
+*/
+
+#ifndef REDIS_POOL_H
+#define REDIS_POOL_H
+
+#include "common.h"
+
+/* redis_pool is forward-declared in common.h (attached to redis_object). */
+
+/*
+ * Create a pool from constructor options.
+ * If `opts` carries an enabled 'pool' key, builds the async pool, copies the
+ * template connection config and attaches it to redis->pool. If no pool is
+ * requested, leaves redis->pool == NULL. Returns FAILURE (with an exception)
+ * on bad config or when the async runtime is unavailable.
+ */
+int redis_pool_create(redis_object *redis, HashTable *opts);
+
+/* Tear down the pool: release active conns, detach bindings, close async pool. */
+void redis_pool_destroy(redis_object *redis);
+
+/*
+ * Per-coroutine checkout. Returns a READY RedisSock or NULL on failure
+ * (throws unless no_throw). Reuses the coroutine's pinned connection when one
+ * is already bound; otherwise acquires from the pool, parking the coroutine if
+ * the pool is exhausted.
+ */
+RedisSock *redis_pool_acquire_conn(redis_object *redis, int no_throw);
+
+/*
+ * Return the coroutine's connection to the pool unless it is pinned
+ * (mid MULTI/PIPELINE, WATCH active, subscribed, or on a non-default DB).
+ * Called at the tail of the command dispatchers. No-op when `id` is not a
+ * Redis object or the object has no pool.
+ */
+void redis_pool_maybe_release(zval *id);
+
+#endif /* REDIS_POOL_H */

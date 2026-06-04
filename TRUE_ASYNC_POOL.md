@@ -1,315 +1,340 @@
-# TrueAsync Connection Pool для phpredis — план разработки и алгоритм
+# TrueAsync connection pool for phpredis — design & algorithm
 
-Статус: **дизайн-документ**. Код ещё не написан. Тесты в `tests/async/` —
-исполняемая спецификация (пока не проходят).
+A transparent connection pool for phpredis under TrueAsync, mirroring the proven
+PDO pool (`php-src/ext/pdo/pdo_pool.{c,h}`) and adding multiplexing on top — the
+best of both worlds.
 
-Автор: Edmond. Цель: дать phpredis прозрачный пул соединений под TrueAsync,
-повторяя проверенную модель PDO-пула (`php-src/ext/pdo/pdo_pool.{c,h}`) и
-добавляя поверх неё мультиплекс — «лучшее из двух миров».
+**Status**
+
+- **Stage 1 (checkout pool): implemented & tested.** `redis_pool.{c,h}`, wired
+  into the command path; concurrent coroutines, transaction pinning and
+  concurrent-MULTI isolation pass under ASAN.
+- **Stage 2 (multiplexing): designed, not yet implemented.** See §5.
 
 ---
 
-## 0. Контекст и предпосылки
+## 0. Context
 
-- Ветка `true-async` форка phpredis сейчас почти пустая (только PHP 8.6-шимы в
-  `common.h`). Весь I/O идёт через `php_stream`.
-- Под TrueAsync блокирующее чтение `php_stream` **внутри корутины паркуется
-  автоматически** через реактор. Значит существующий синхронный код phpredis
-  («write команду → blocking read ответа») **корректно работает в модели
-  "одно соединение на корутину"** без хирургии в command-path.
-- Опасность только одна: один `RedisSock` нельзя использовать из двух корутин
-  одновременно — общие `stream`, `reply_callback`, `pipeline_cmd`, `mode`
-  перемешают команды/ответы. Нужна координация.
+- The `true-async` fork of phpredis was essentially empty (only PHP 8.6 shims).
+  All I/O goes through `php_stream`.
+- Under TrueAsync a blocking `php_stream` read **inside a coroutine parks
+  automatically** via the reactor. So the existing synchronous phpredis code
+  ("write command → blocking read reply") is **already correct in a
+  one-connection-per-coroutine model** with no surgery in the command path.
+- The single hazard: one `RedisSock` must not be used by two coroutines at once
+  — the shared `stream`, `reply_callback`, `pipeline_cmd` and `mode` would
+  interleave commands and replies. Coordination is required.
 
-### Почему пул для Redis — отдельный вопрос
+### Why pooling for Redis is its own question
 
-В отличие от SQL, Redis отвечает на одном соединении **строго в порядке команд**
-(in-order RESP). Поэтому для Redis технически возможны ДВЕ модели, и индустрия
-раскололась пополам:
+Unlike SQL, Redis replies on a single connection arrive **strictly in command
+order** (in-order RESP). So Redis admits *two* models, and the ecosystem is
+split down the middle:
 
-| Модель | Кто | Суть |
+| Model | Used by | Idea |
 |---|---|---|
-| Мультиплекс (1 общий сокет) | Lettuce, StackExchange.Redis, redis-rs `MultiplexedConnection`, ioredis | Все корутины пишут в один сокет, отдельный reader разбирает ответы FIFO. Автопайплайнинг даром. |
-| Пул соединений (checkout) | Jedis, go-redis, redis-py, deadpool | N соединений, корутина берёт одно эксклюзивно. Как наш PDO-пул. |
+| Multiplex (1 shared socket) | Lettuce, StackExchange.Redis, redis-rs `MultiplexedConnection`, ioredis | All coroutines write into one socket; replies are matched FIFO. Implicit pipelining for free. |
+| Connection pool (checkout) | Jedis, go-redis, redis-py, deadpool | N connections, each coroutine borrows one exclusively. Like our PDO pool. |
 
-Часть команд **нельзя** мультиплексировать (захватывают соединение целиком):
-`MULTI/EXEC`+`WATCH`, `SUBSCRIBE/PSUBSCRIBE`, блокирующие `BLPOP/BRPOP/WAIT`,
-`pipeline()`, `SELECT`. Поэтому все «мультиплекс»-клиенты на деле **гибридны**:
-мультиплекс для stateless request/reply + выделенное соединение для остального.
+Some commands **cannot** be multiplexed (they seize the whole connection):
+`MULTI/EXEC`+`WATCH`, `SUBSCRIBE/PSUBSCRIBE`, blocking `BLPOP/BRPOP/WAIT`,
+`pipeline()`, `SELECT`. So every "multiplexing" client is in fact **hybrid**:
+multiplex for ordinary request/reply, a dedicated connection for the rest.
+Lettuce is the canonical example.
 
-**Почему мультиплекс важен под TrueAsync.** Redis-сервер однопоточный. При пуле
-из 10 соединений и 1000 корутин 990 паркуются в ожидании. При мультиплексе все
-1000 команд льются в один сокет, пайплайнятся, сервер молотит их подряд без
-простоя на RTT. Для кэш-нагрузки (куча мелких GET/SET) — разница в разы.
+**Why multiplexing matters under TrueAsync.** Redis is single-threaded. With a
+pool of 10 connections and 1000 coroutines, 990 park waiting. With multiplexing
+all 1000 commands stream into one socket, pipeline, and the server chews through
+them back-to-back with no RTT stalls. For cache workloads (many small GET/SET)
+that is a multiple-x difference.
 
 ---
 
-## 1. Целевая архитектура (гибрид)
+## 1. Target architecture (hybrid)
 
-Пул из `max` физических соединений делится на две группы:
+The `max` physical connections split into two groups:
 
 ```
             ┌──────────────────────── zend_async_pool_t ───────────────────────┐
             │                                                                   │
-   корутина │   ┌─ mux-резерв (mux=N) ─┐      ┌─── checkout-пул (max - N) ───┐  │
-   ─────────┼──>│  shared socket #1     │      │  conn  conn  conn  conn ...  │  │
-   stateless│   │  shared socket #2     │      │  (персонально, эксклюзивно)  │  │
-            │   │  (общая FIFO-очередь) │      └──────────────────────────────┘  │
-            │   └───────────────────────┘                ▲                       │
-   корутина │            ▲                                │                       │
+   coroutine│   ┌─ mux reserve (mux=N) ─┐     ┌──── checkout pool (max - N) ──┐ │
+   ─────────┼──>│  shared socket #1      │     │  conn  conn  conn  conn ...   │ │
+   stateless│   │  shared socket #2      │     │  (personal, exclusive)        │ │
+            │   │  (shared FIFO queue)   │     └───────────────────────────────┘ │
+            │   └────────────────────────┘                ▲                      │
+   coroutine│            ▲                                 │                      │
    ─────────┼────────────┘                       stateful: MULTI/WATCH/SUB/      │
    stateful │     stateless: GET/SET/...          BLPOP/SELECT/pipeline          │
             └───────────────────────────────────────────────────────────────────┘
 ```
 
-- **mux-резерв** (`mux=2..3`): эти соединения **никому не выдаются персонально**.
-  Их обслуживает общая очередь запросов — Stage 2. Stateless-команды идут сюда.
-- **checkout-пул** (остальные): выдаются корутине эксклюзивно на время stateful
-  работы — Stage 1. Это в точности «логика транзакций» из PDO-пула.
+- **mux reserve** (`mux=2..3`): never handed out personally. A shared request
+  queue drives them (Stage 2). Stateless commands go here.
+- **checkout pool** (the rest): lent to a coroutine exclusively for the duration
+  of stateful work (Stage 1). This is exactly the "transaction" logic from the
+  PDO pool.
 
-Решение «куда пойдёт команда» принимается в одной точке (`redis_sock_get`),
-по типу команды и текущему состоянию соединения корутины.
+A single point (`redis_sock_get`) decides where a command goes, based on the
+command kind and the connection's current state.
 
-### Две стадии разработки
+### Two stages
 
-- **Stage 1 — Checkout-пул** («шарить сокет по очереди во времени»). Прямой порт
-  `pdo_pool`. Корутина берёт физический `RedisSock` эксклюзивно, держит во время
-  burst-а команд / транзакции, возвращает в пул. Корректно для ВСЕХ типов команд
-  сразу. Низкий риск. Самодостаточно и отгружаемо.
-- **Stage 2 — Multiplex-очередь** («делать очередь»). Поверх Stage 1: reader-
-  корутина + FIFO reply-router на mux-резерве. Stateless-команды уходят сюда,
-  stateful — остаются на checkout. Это и есть полный гибрид Lettuce.
+- **Stage 1 — Checkout pool** ("share the socket by taking turns in time"). A
+  direct port of `pdo_pool`. A coroutine borrows a physical `RedisSock`
+  exclusively, holds it across a burst of commands / a transaction, and returns
+  it. Correct for *all* command kinds at once. Low risk. Self-contained.
+- **Stage 2 — Multiplex queue** ("build the queue"). On top of Stage 1: an
+  event-driven reply pump over the mux reserve. Stateless commands go here;
+  stateful ones stay on checkout. This is the full Lettuce-style hybrid.
 
-Stage 1 — фундамент: выделенные соединения для blocking/pubsub/txn нужны в
-гибриде в любом случае.
+Stage 1 is the foundation — dedicated connections for blocking/pubsub/txn are
+needed by the hybrid anyway.
 
 ---
 
-## 2. Структуры данных
+## 2. Data structures
 
-Зеркалят `pdo_pool_binding_t` / поля `pdo_dbh_t`.
+Mirror `pdo_pool_binding_t` / the `pdo_dbh_t` pool fields.
 
 ```c
-/* redis_pool.h */
+/* redis_pool.c */
 
-/* Per-coroutine привязка. Аналог pdo_pool_binding_t. */
-typedef struct _redis_pool_binding {
-    zend_async_event_callback_t event;   /* коллбэк на финал корутины */
-    RedisSock  *conn;                    /* выданный физический conn, или NULL */
-    zend_ulong  coro_key;
-    bool        has_coro_callback;
+/* Per-coroutine binding. Analogue of pdo_pool_binding_t. */
+typedef struct {
+    zend_async_event_callback_t event;  /* coroutine-finalize callback */
+    redis_async_pool *rp;               /* owning pool, NULL once destroyed */
+    RedisSock        *conn;             /* checked-out conn, or NULL */
+    zend_ulong        coro_key;
+    bool              has_coro_callback;
 } redis_pool_binding_t;
 
-/* Состояние пула, висит на объекте Redis (template). */
-typedef struct _redis_pool {
-    zend_async_pool_t *async_pool;       /* физические RedisSock внутри */
-    HashTable         *bindings;         /* coro_key -> redis_pool_binding_t */
-    zend_object       *wrapper;          /* PHP-обёртка пула (getPool()) */
-
-    /* конфиг фабрики: копия connect-параметров шаблона */
-    zend_string *host; int port;
-    zend_string *user; zend_string *pass;
-    double timeout, read_timeout;
-    long   db_default;                   /* SELECT по умолчанию для каждого conn */
-    /* ... serializer/compression/prefix — клиентские, одинаковы для всех ... */
-
-    uint32_t mux_reserve;                /* Stage 2: соединений под мультиплекс */
-    /* Stage 2: redis_mux_t *mux; (см. §5) */
-} redis_pool;
+/* Pool state, attached to the redis_object (the template). */
+struct _redis_async_pool {
+    zend_async_pool_t *async_pool;      /* physical RedisSock resources */
+    HashTable         *bindings;        /* coro_key -> redis_pool_binding_t* */
+    HashTable         *opts;            /* dup'd ctor options; factory replays */
+    zend_object       *wrapper;         /* PHP pool wrapper (getPool()), lazy */
+    long               db_default;      /* configured DB; drift pins the conn */
+    uint32_t           mux_reserve;     /* connections reserved for multiplexing */
+};
 ```
 
-Объект `Redis` в pool-режиме — **шаблон**: его собственный `RedisSock *sock`
-не подключён (или NULL), а реальные соединения живут в `async_pool`. Точно как
-`pdo_dbh_t.driver_data == NULL` в PDO-пуле.
+In pool mode the `Redis` object is a **template**: its own `RedisSock` is never
+opened (it only holds config), and the live connections live in `async_pool` —
+exactly like `pdo_dbh_t.driver_data == NULL` in the PDO pool.
 
-Физическое соединение = полноценный `RedisSock` от фабрики (host/port/auth/db
-идентичны для всех), со своим `php_stream`.
+A physical connection is a full `RedisSock` from the factory (host/port/auth/db
+identical for all), each with its own `php_stream`.
 
 ---
 
-## 3. Точки интеграции (минимальная хирургия)
+## 3. Integration points (minimal surgery)
 
-phpredis уже даёт два чокпойнта — через них проходит почти каждая команда:
+phpredis already funnels almost every command through two chokepoints:
 
-- `redis_sock_get(zval *id, int nothrow)` — `library.c`, возвращает `RedisSock*`.
-- `redis_process_cmd()` / `redis_process_kw_cmd()` — `redis.c:674/708`. Обе:
+- `redis_sock_get(zval *id, int nothrow)` — `library.c`, returns a `RedisSock*`.
+- `redis_process_cmd()` / `redis_process_kw_cmd()` — `redis.c`. Both:
   1. `redis_sock = redis_sock_get(getThis(), 0);`
-  2. строят команду, пишут, читают ответ;
-  3. `if (IS_ATOMIC(redis_sock)) resp_cb(...); else буферизуют (MULTI/PIPELINE)`.
+  2. build the command, write it, read the reply;
+  3. `if (IS_ATOMIC(redis_sock)) resp_cb(...); else buffer (MULTI/PIPELINE)`.
 
-**Интеграция Stage 1 — ровно две правки:**
+**Stage 1 integration — two edits:**
 
-1. `redis_sock_get()` делаем pool-aware:
+1. `redis_sock_get()` becomes pool-aware:
    ```c
-   RedisSock *redis_sock_get(zval *id, int nothrow) {
-       redis_object *obj = ...;
-       if (obj->pool == NULL) return obj->sock;        /* как сегодня */
-       return redis_pool_acquire_conn(obj);            /* per-coro checkout */
+   if (Z_TYPE_P(id) == IS_OBJECT) {
+       redis_object *obj = PHPREDIS_ZVAL_GET_OBJECT(redis_object, id);
+       if (obj->pool != NULL) {
+           return redis_pool_acquire_conn(obj, no_throw);  /* per-coro checkout */
+       }
    }
+   /* ...existing path... */
    ```
-2. В хвост `redis_process_cmd` / `redis_process_kw_cmd` (после обработки ответа)
-   добавить `redis_pool_maybe_release(getThis())`.
+2. The tail of `redis_process_cmd` / `redis_process_kw_cmd` calls
+   `redis_pool_maybe_release(getThis())`.
 
-Команды, минующие эти функции (subscribe, multi/exec, raw, pipeline) — это
-**ровно stateful-команды, которые пиннят соединение**, поэтому они естественно
-держат conn до завершения. Отдельной обработки для Stage 1 не требуют.
+Commands that bypass these (subscribe, multi/exec, raw, pipeline) are exactly
+the stateful ones that pin the connection, so they naturally hold it. They need
+no extra handling in Stage 1.
+
+Plus: `__construct` calls `redis_pool_create()` after `redis_sock_configure`;
+`free_redis_object` calls `redis_pool_destroy`; `redis_sock_configure` accepts
+the `pool` key silently; `redis_object` gains a `redis_async_pool *pool` field.
 
 ---
 
-## 4. Алгоритм Stage 1 — Checkout-пул
+## 4. Algorithm — Stage 1 (checkout pool)
 
-### 4.1. Acquire (порт `pdo_pool_acquire_conn`)
+### 4.1 Acquire (port of `pdo_pool_acquire_conn`)
 
 ```
 redis_pool_acquire_conn(obj):
-    coro_key = current_coroutine_key()        # 0 если вне корутины
+    coro_key = current_coroutine_key()          # 0 outside a coroutine
     binding  = obj->pool->bindings[coro_key]
 
     if binding && binding->conn:
-        if binding->conn не сломан: return binding->conn   # reuse в этой корутине
-        else: detach (release если refcount==0), binding->conn = NULL
+        return binding->conn                     # reuse within this coroutine
 
-    resource = ZEND_ASYNC_POOL_ACQUIRE(async_pool, timeout)   # ПАРКУЕТ если пусто
-    if !resource: return NULL                                  # ошибка/таймаут
+    resource = ZEND_ASYNC_POOL_ACQUIRE(async_pool, timeout=0)   # PARKS if empty
+    if !resource: throw / return NULL
 
     if !binding:
         binding = ecalloc(...)
-        binding->event.callback = redis_pool_on_coroutine_finish
-        binding->event.dispose  = redis_pool_binding_dispose
+        binding->event.callback = on_coroutine_finish
+        binding->event.dispose  = binding_dispose
         binding->coro_key = coro_key
         bindings[coro_key] = binding
-        coro->event.add_callback(coro, &binding->event)   # release на финале корутины
+        coro->event.add_callback(coro, &binding->event)   # release on finalize
 
     binding->conn = resource
     return binding->conn
 ```
 
-### 4.2. Pin-предикат (аналог PDO `in_txn`)
+### 4.2 Pin predicate (analogue of PDO `in_txn`)
 
-Соединение НЕЛЬЗЯ вернуть в пул, пока оно «грязное» (stateful):
+A connection must not return to the pool while "dirty" (stateful):
 
 ```c
-static bool redis_conn_is_pinned(RedisSock *s) {
-    return !IS_ATOMIC(s)                 /* идёт буферизация MULTI или PIPELINE */
-        || s->watching                   /* WATCH — оптимистическая блокировка */
-        || redis_sock_is_subscribed(s)   /* pub/sub режим */
-        || s->dbNumber != pool->db_default; /* SELECT увёл с дефолтной БД */
-    /* блокирующие (BLPOP) флага не требуют: корутина запаркована ВНУТРИ вызова,
-       держа conn, release между командами для них не вызывается. */
+static bool redis_conn_is_pinned(const redis_async_pool *rp, RedisSock *s) {
+    return !IS_ATOMIC(s)                 /* MULTI or PIPELINE buffering */
+        || s->watching                   /* WATCH — optimistic lock */
+        || redis_pool_sock_subscribed(s) /* pub/sub mode */
+        || s->dbNumber != rp->db_default; /* SELECT moved off default DB */
+    /* blocking commands (BLPOP) need no flag: the coroutine is parked *inside*
+       the call holding the conn, so release-between-commands never runs. */
 }
 ```
 
-### 4.3. Maybe-release (порт `pdo_pool_maybe_release`)
+### 4.3 Maybe-release (port of `pdo_pool_maybe_release`)
 
 ```
-redis_pool_maybe_release(obj):
-    binding = obj->pool->bindings[current_coro_key]
+redis_pool_maybe_release(id):                    # called at command-dispatch tail
+    binding = pool->bindings[current_coro_key]
     if !binding || !binding->conn: return
-    if redis_conn_is_pinned(binding->conn): return        # держим за корутиной
+    if redis_conn_is_pinned(pool, binding->conn): return   # keep pinned
     ZEND_ASYNC_POOL_RELEASE(async_pool, binding->conn)
     binding->conn = NULL
 ```
 
-Вызывается в хвосте `redis_process_cmd`/`_kw_cmd`. Итог: между обычными
-командами соединение возвращается в пул (как PDO между statement-ами), а во
-время MULTI/WATCH/SUBSCRIBE/чужой-БД — пиннится за корутиной.
+Net effect: between ordinary commands the connection returns to the pool (like
+PDO between statements); during MULTI/WATCH/SUBSCRIBE/non-default-DB it stays
+pinned to the coroutine.
 
-### 4.4. Финал корутины (порт `pdo_pool_binding_on_coroutine_finish`)
+### 4.4 Coroutine finalize
 
-Когда корутина завершается, её зарегистрированный коллбэк:
-- если `binding->conn != NULL` — сбрасывает состояние и `RELEASE` обратно в пул
-  (страховка от утечки соединения, если корутина умерла в транзакции/подписке);
-- освобождает binding.
+On coroutine end the registered callback force-releases a still-held connection
+(safety net if the coroutine died mid-transaction/subscription) and frees the
+binding.
 
-### 4.5. Коллбэки пула (`ZEND_ASYNC_NEW_POOL`)
+### 4.5 Pool callbacks (`ZEND_ASYNC_NEW_POOL`)
 
-Зеркалят PDO-фабрику:
-
-- `factory`     → `redis_sock_create` + `redis_sock_connect` + AUTH + `SELECT
-  db_default` + readonly/HELLO. Один conn = одна реальная TCP/UDS-сессия.
+- `factory`     → `redis_sock_create` + replay options via `redis_sock_configure`
+  + `redis_sock_server_open` (connect → AUTH → SELECT default DB). One conn = one
+  real TCP/UDS session.
 - `destructor`  → disconnect + free `RedisSock`.
-- `healthcheck` → liveness (`redis_stream_liveness_check` /
-  `redis_stream_detect_dirty`), опц. PING.
-- `before_acquire` → опц. проверка живости перед выдачей.
-- `before_release` → **очистка состояния** (страховка): если в MULTI — DISCARD;
-  watching — UNWATCH; subscribed — UNSUBSCRIBE/RESET; `dbNumber != default` —
-  SELECT обратно; очистить `pipeline_cmd`. Непрочитанные байты в сокете → conn
-  битый (не возвращать в пул).
+- `healthcheck` → cheap liveness (`php_stream_eof`).
+- `before_acquire` → reject a connection that has gone bad.
+- `before_release` → recycle only clean, atomic, default-DB connections; drop
+  anything still stateful rather than leak state to the next borrower (force-
+  release safety net; the pin predicate normally prevents reaching here dirty).
 
-### 4.6. Корректность connection-scoped состояния
+### 4.6 Connection-scoped state correctness
 
-Только серверное session-состояние течёт между заёмщиками: `SELECT`, `WATCH`,
-`MULTI`, `SUBSCRIBE`, `CLIENT SETNAME/TRACKING`. Клиентское (serializer, prefix,
-compression) одинаково на всех conn (ставится фабрикой) — не течёт.
+Only server session state leaks between borrowers: `SELECT`, `WATCH`, `MULTI`,
+`SUBSCRIBE`, `CLIENT SETNAME/TRACKING`. Client-side config (serializer, prefix,
+compression) is identical on every connection (set by the factory) — no leak.
 
-Правило v1: фабрика выставляет `db_default`; runtime-`SELECT` на другую БД
-делает conn pinned (через предикат §4.2) — он не вернётся в общий пул, пока БД
-не дефолтная. Это просто и корректно. (Альтернатива — сброс на release; выбрано
-pinning как менее «болтливое».)
+v1 rule: the factory applies `db_default`; a runtime `SELECT` to another DB pins
+the connection (predicate §4.2), so it is never returned to the shared pool
+while off-default. Simple and correct within a coroutine; on finalize the dirty
+connection is dropped rather than recycled.
 
 ---
 
-## 5. Алгоритм Stage 2 — Multiplex-очередь
+## 5. Algorithm — Stage 2 (multiplex queue)
 
-Включается, когда `mux_reserve > 0`. Цель — stateless-команды многих корутин
-гонять по 1–3 общим сокетам с автопайплайнингом.
+Enabled when `mux_reserve > 0`. Goal: stream many coroutines' stateless commands
+over 1–3 shared sockets with implicit pipelining.
 
-### 5.1. Классификация команды
+**Key principle (corrected): no dedicated reader coroutine.** Replies are read
+**event-driven, in C callbacks running between coroutines**, driven by socket
+readability — exactly the `curl_poll_callback` pattern in `ext/curl/curl_async.c`.
+No coroutine is spent blocking on the read; no extra context switches.
 
-```c
-static bool redis_cmd_is_multiplexable(RedisSock *s /*текущее состояние*/, cmd) {
-    if (!IS_ATOMIC(s) || s->watching || redis_sock_is_subscribed(s)) return false;
-    if (cmd ∈ {SUBSCRIBE,PSUBSCRIBE,SSUBSCRIBE,MULTI,WATCH,
-               BLPOP,BRPOP,BLMOVE,BRPOPLPUSH,BLMPOP,BZPOPMIN,BZPOPMAX,
-               WAIT,WAITAOF,SELECT,SWAPDB,MONITOR,...}) return false;
-    return true;
-}
-```
+### 5.1 The pieces
 
-### 5.2. Диспетчер (расширение `redis_sock_get` в гибриде)
+Per multiplexed socket (`redis_mux_t`):
+
+- `RedisSock *sock` — the shared physical connection.
+- **A waiter ring buffer** — the FIFO of in-flight requests. Use the existing
+  `zend_async_channel_t` (`ZEND_ASYNC_NEW_CHANNEL`): it *is* a ring buffer, and
+  pushing into it gives a ready-made trigger to pump. Each waiter holds
+  `{ awaitable event, resp_cb, ctx }`.
+- `zend_async_poll_event_t *read_ev` — a READABLE poll event on the socket FD
+  (`ZEND_ASYNC_NEW_SOCKET_EVENT(fd, ASYNC_READABLE)`), started lazily while the
+  FIFO is non-empty, stopped when it drains.
+- A parse buffer for partial RESP frames split across reads.
+- A write baton / out-buffer to serialize concurrent writes (and optionally
+  batch frames before flush → pipelining).
+
+### 5.2 Dispatch (mux extension of `redis_sock_get`)
 
 ```
 redis_sock_get(obj):
     if !pool: return obj->sock
     binding = bindings[coro_key]
-    if binding && binding->conn: return binding->conn        # уже пиннут (checkout)
-    if mux && redis_cmd_is_multiplexable(...): return MUX_SENTINEL  # см. §5.3
+    if binding && binding->conn: return binding->conn        # already pinned (checkout)
+    if mux && redis_cmd_is_multiplexable(state, cmd): MUX path (§5.3)
     return redis_pool_acquire_conn(obj)                      # checkout
 ```
 
-### 5.3. Reply-router (сердце Stage 2)
+`redis_cmd_is_multiplexable` excludes `SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE, MULTI,
+WATCH, BLPOP/BRPOP/BLMOVE/BLMPOP/BZPOP*, WAIT/WAITAOF, SELECT/SWAPDB, MONITOR`
+and any non-atomic / watching / subscribed state.
 
-Один общий сокет обслуживается так:
+### 5.3 Command flow (mux mode)
 
-- **Запись.** Корутина сериализует свою команду (полный RESP-фрейм) и пишет в
-  общий сокет под write-«батоном» (по границам команд писать безопасно). Можно
-  батчить несколько фреймов перед flush — это и есть автопайплайнинг.
-- **Учёт.** Команда кладёт «ожидающего» в FIFO сокета: `{coro, resp_cb, ctx}`.
-- **Чтение.** На сокет назначена единственная **reader-корутина**. Она парсит
-  ответы строго по порядку; на каждый ответ снимает голову FIFO, выполняет её
-  `resp_cb` от имени originator-а и **резюмит** запаркованную корутину с готовым
-  zval.
-- Корутина-отправитель после записи паркуется на своём awaitable и просыпается,
-  когда reader отдал её ответ.
+A coroutine issuing a multiplexable command:
 
-То есть в mux-режиме `redis_read_reply` у вызывающей корутины заменяется на
-«enqueue waiter + suspend», а фактическое чтение делает reader. `fold_item`/
-`reply_callback` на `RedisSock` сейчас per-socket и предполагают чтение в
-контексте вызывающего — в mux их исполняет reader от имени originator-а. Это
-основной объём работы Stage 2.
+1. Serialize its RESP frame.
+2. Write it to the shared socket under the write baton (or append to the
+   out-buffer for batched flush — implicit pipelining).
+3. Push a waiter `{ awaitable, resp_cb, ctx }` into the channel ring buffer.
+4. Ensure `read_ev` is started.
+5. Park on its awaitable (suspend).
 
-### 5.4. Деградация в checkout
+### 5.4 Reply pump (C callback — the heart of Stage 2)
 
-Если команда не мультиплексируема (§5.1) или mux-сокет помечен битым — корутина
-прозрачно уходит на `redis_pool_acquire_conn` (Stage 1). Stateful-сценарий
-(MULTI/SUB/BLPOP) всегда на персональном соединении.
+Fires on **socket-readable** (`read_ev`) and on **channel push** (drain
+immediately in case a reply is already buffered). Runs between coroutines:
+
+```
+redis_mux_pump(mux):
+    n = non_blocking_read(sock, parse_buf)        # poll/recv, NEVER parks
+    if n == EOF or error: fail_all_waiters(mux); teardown(mux); return
+    while parse_buf holds a complete RESP reply:
+        waiter = channel_pop_front(mux->channel)  # FIFO order == reply order
+        run waiter.resp_cb on the reply -> waiter result
+        ZEND_ASYNC_CALLBACKS_NOTIFY(waiter.awaitable, result, NULL)  # resume coroutine
+    if channel is empty: read_ev.stop()
+```
+
+The originating coroutine wakes with its own reply. Because Redis preserves
+reply order on a connection, FIFO pop matches replies to requests with no
+correlation IDs.
+
+### 5.5 Degrade to checkout
+
+A non-multiplexable command, or a mux socket marked broken, transparently falls
+back to `redis_pool_acquire_conn` (Stage 1). Stateful scenarios
+(MULTI/SUB/BLPOP) always run on a personal connection.
 
 ---
 
 ## 6. PHP-level API
 
-Прозрачный пул (как PDO: один объект, шарится между корутинами), конфиг через
-опции конструктора `Redis` (phpredis 6 уже принимает ассоц-массив):
+Transparent pool (like PDO: one object shared across coroutines), configured via
+constructor options (phpredis 6 already accepts an assoc array):
 
 ```php
 $redis = new Redis([
@@ -318,105 +343,91 @@ $redis = new Redis([
     'auth' => ['user', 'pass'],
     'pool' => [
         'enabled' => true,
-        'min'     => 0,     // прогрев
-        'max'     => 16,    // всего физических соединений
-        'mux'     => 2,     // Stage 2: резерв под мультиплекс (0 = выкл)
+        'min'     => 0,     // prewarm
+        'max'     => 16,    // total physical connections
+        'mux'     => 2,     // Stage 2: reserve for multiplexing (0 = off)
     ],
 ]);
 
-// Дальше — обычный phpredis. Прозрачно для пользователя:
-Async\spawn(fn() => $redis->get('a'));   // mux fast-path
-Async\spawn(fn() => {                     // checkout: транзакция пиннит conn
+// Then it is ordinary phpredis — transparent to the user:
+Async\spawn(fn() => $redis->get('a'));   // mux fast path
+Async\spawn(function () use ($redis) {    // checkout: the transaction pins a conn
     $redis->multi();
     $redis->set('x', 1);
     $redis->exec();
 });
 ```
 
-Опционально `$redis->getPool()` → PHP-обёртка для интроспекции (count/idle/active),
-как `PDO::getPool()` (см. `pdo_pool_get_wrapper`).
+Optional `$redis->getPool()` → a PHP wrapper for introspection
+(count/idle/active), like `PDO::getPool()`. (Not yet implemented.)
 
 ---
 
-## 7. План работ (чеклист)
+## 7. Work checklist
 
-### Stage 1 — Checkout-пул
-- [ ] `redis_pool.{c,h}`: структуры, init/shutdown, create/destroy.
-- [ ] Парсинг опции `pool` в конструкторе/`connect`; объект → template-режим.
-- [ ] Фабрика/destructor/healthcheck/before_acquire/before_release на
+### Stage 1 — checkout pool — DONE
+- [x] `redis_pool.{c,h}`: structures, create/destroy.
+- [x] Parse the `pool` option in the constructor; object → template mode.
+- [x] factory / destructor / healthcheck / before_acquire / before_release on
       `ZEND_ASYNC_NEW_POOL`.
-- [ ] `redis_pool_acquire_conn` / `redis_pool_maybe_release` / on-finish callback.
-- [ ] `redis_sock_get` → pool-aware; хвост `redis_process_cmd`/`_kw_cmd` → release.
-- [ ] `redis_conn_is_pinned` + проверка по MULTI/PIPELINE/WATCH/SUB/SELECT.
-- [ ] Корректное поведение `subscribe`/`multi`/`pipeline`/blocking (пиннинг).
-- [ ] `getPool()` обёртка (опц.).
-- [ ] Тесты `tests/async/` (см. §8).
+- [x] `redis_pool_acquire_conn` / `redis_pool_maybe_release` / on-finish callback.
+- [x] `redis_sock_get` pool-aware; `redis_process_cmd`/`_kw_cmd` tail release.
+- [x] `redis_conn_is_pinned` (MULTI/PIPELINE/WATCH/SUB/SELECT).
+- [x] Tests `tests/async/` (single, concurrent, transaction pin, MULTI isolation).
+- [ ] `getPool()` wrapper (introspection; tests 001/004 wait on it).
 
-### Stage 2 — Multiplex-очередь
-- [ ] `redis_cmd_is_multiplexable` классификатор.
-- [ ] Структура mux-сокета: write-батон, FIFO waiters, reader-корутина.
-- [ ] Reply-router: парс по порядку, resp_cb от имени originator, resume.
-- [ ] Замена read-пути в mux-режиме (suspend/resume вместо blocking read).
-- [ ] Деградация в checkout для не-мультиплексируемых/битых.
-- [ ] Батчинг записи (автопайплайнинг) + flush-стратегия.
-- [ ] Тесты mux: порядок ответов, конкуренция, fallback на stateful, битый сокет.
+### Stage 2 — multiplex queue
+- [ ] `redis_cmd_is_multiplexable` classifier.
+- [ ] `redis_mux_t`: write baton, channel ring buffer, READABLE poll event.
+- [ ] Reply pump: non-blocking drain, FIFO match, `ZEND_ASYNC_CALLBACKS_NOTIFY`.
+- [ ] Write batching (implicit pipelining) + flush strategy.
+- [ ] Degrade to checkout for non-multiplexable / broken sockets.
+- [ ] Tests: reply ordering under interleaving, fallback, broken socket, batching.
 
 ---
 
-## 8. Тесты (`tests/async/`)
+## 8. Tests (`tests/async/`)
 
-Формат — `.phpt` в стиле `php-src/ext/async/tests` (корутины `Async\spawn` /
-`await`), НЕ синхронный `TestRedis.php`. Хелпер `inc/async_redis_pool_test.inc`
-по образцу `ext/async/tests/pdo_mysql/inc/async_pdo_mysql_test.inc`:
-`skipIfNoAsync()`, `skipIfNoRedis()`, `poolFactory(max, mux)`.
+`.phpt` in the `php-src/ext/async/tests` style (coroutines via `Async\spawn` /
+`await`), not the synchronous `TestRedis.php`. Helper
+`inc/async_redis_pool_test.inc` after `ext/async/tests/pdo_mysql/inc/...`:
+`skipIfNoAsync()`, `skipIfNoRedis()`, `skipIfNoServer()`, `poolFactory(max, mux)`.
 
-Инварианты chaos-стиля (истинны при любой интерливинге — считаем attempts/
-success, а не точные значения).
+Chaos-style invariants (true under any interleaving — count attempts/successes,
+not exact values).
 
-### Stage 1
-1. `001` — pool construct: объект в template-режиме, idle/active/count.
-2. `002` — одна корутина: GET/SET сквозь пул, тот же conn переиспользуется.
-3. `003` — N корутин конкурентно: каждая видит изолированный результат.
-4. `004` — backpressure: `max=1`, вторая корутина паркуется до release
-   (порт `pool/029-pool_acquire_blocks_until_release.phpt`).
-5. `005` — транзакция пиннит conn: MULTI…EXEC на одном физическом соединении.
-6. `006` — изоляция: конкурентные MULTI в двух корутинах не перемешиваются.
-7. `007` — WATCH/UNWATCH удерживает conn между вызовами.
-8. `008` — pub/sub: SUBSCRIBE пиннит, обычные команды других корутин не страдают.
-9. `009` — блокирующий BLPOP держит свой conn; пул не «съеден» для остальных.
-10. `010` — финал корутины в открытой транзакции → conn вычищен и возвращён.
-11. `011` — cancellation корутины во время команды → conn не утёк/не битый.
-12. `012` — SELECT на не-дефолтную БД пиннит conn (не течёт к следующему).
+Current: 002 (single), 003 (concurrent), 005 (transaction pin), 006 (concurrent
+MULTI isolation) pass. 001 (construct introspection) and 004 (backpressure
+observability) need `getPool()`.
 
-### Stage 2
-13. `101` — mux: много GET из N корутин по 1 сокету, все ответы корректны.
-14. `102` — порядок: ответы матчатся отправителям при интерливинге.
-15. `103` — fallback: MULTI/SUBSCRIBE/BLPOP в mux-режиме уходят на checkout.
-16. `104` — битый mux-сокет → деградация в checkout, без потери ответов.
-17. `105` — автопайплайнинг: K команд в один тик → один flush (наблюдаемо по RTT).
+Planned Stage 2: mux many GET over one socket, reply ordering under interleaving,
+fallback for MULTI/SUB/BLPOP, broken mux socket, implicit pipelining.
 
 ---
 
-## 9. Открытые вопросы / риски
+## 9. Open questions / risks
 
-- **Где звать `maybe_release`.** v1: хвост `redis_process_*` (между командами).
-  Альтернатива — release на suspend корутины (через switch-handlers TrueAsync):
-  conn «твой», пока корутина активно бёрстит, и возвращается при парковке. Даёт
-  лучшее переиспользование; отложено до замеров.
-- **Stage 2 reply-router** — основной объём/риск: `fold_item`/`reply_callback`
-  per-socket нужно исполнять в reader от имени originator-а.
-- **RESP3 push** (client tracking, invalidation) — на mux-сокете push-сообщения
-  идут вне FIFO ответов; роутить отдельным каналом (как redis_rs push_sender).
-  Для v1 mux — без RESP3 push / без client-side caching.
-- **Cluster/Sentinel** (`redis_cluster.c`) — вне рамок первой версии; пул сначала
-  для одиночного `Redis`.
+- **Where to call `maybe_release`.** v1: command-dispatch tail (between commands).
+  Alternative — release on coroutine suspend (via TrueAsync switch handlers): the
+  conn is "yours" while the coroutine actively bursts, returned when it parks.
+  Better reuse; deferred until measured.
+- **Stage 2 reply pump** — the response-callback machinery (`fold_item`,
+  `reply_callback`) is per-`RedisSock` and assumes the caller reads; in mux mode
+  the pump runs it on behalf of the originator.
+- **RESP3 push** (client tracking / invalidation) — on a mux socket push frames
+  arrive outside the reply FIFO; route them via a separate channel (like redis-rs
+  `push_sender`). v1 mux: no RESP3 push / no client-side caching.
+- **Cluster / Sentinel** (`redis_cluster.c`) — out of scope for v1; pooling first
+  for the standalone `Redis`.
 
 ---
 
-## 10. Ссылки
+## 10. References
 
-- PDO-пул (эталон): `php-src/ext/pdo/pdo_pool.{c,h}`, `pdo_dbh.c`.
+- PDO pool (the reference): `php-src/ext/pdo/pdo_pool.{c,h}`, `pdo_dbh.c`.
 - Async pool API: `php-src/Zend/zend_async_API.h` (`zend_async_pool_t`,
   `ZEND_ASYNC_NEW_POOL`, `ZEND_ASYNC_POOL_ACQUIRE/RELEASE/CLOSE`).
-- Тест-образцы: `php-src/ext/async/tests/pool/`, `.../pdo_mysql/`.
+- Event-driven socket I/O pattern: `ext/curl/curl_async.c` (`curl_poll_callback`,
+  `ZEND_ASYNC_NEW_SOCKET_EVENT`), `ext/pgsql/pgsql.c`.
+- Channel API: `ZEND_ASYNC_NEW_CHANNEL` in `php-src/Zend/zend_async_API.h`.
 - Redis pooling vs multiplexing: <https://redis.io/docs/latest/develop/clients/pools-and-muxing/>

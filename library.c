@@ -3118,6 +3118,12 @@ redis_sock_configure(RedisSock *redis_sock, HashTable *opts)
                 REDIS_VALUE_EXCEPTION("Invalid backoff options");
                 return FAILURE;
             }
+        } else if (zend_string_equals_literal_ci(zkey, "pool")) {
+            /* Consumed by redis_pool_create() after configure runs. */
+            if (Z_TYPE_P(val) != IS_ARRAY) {
+                REDIS_VALUE_EXCEPTION("Invalid pool options");
+                return FAILURE;
+            }
         } else {
              php_error_docref(NULL, E_WARNING, "Skip unknown option '%s'", ZSTR_VAL(zkey));
         }

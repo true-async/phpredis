@@ -347,8 +347,13 @@ typedef struct {
     int nb_active;
 } ConnectionPool;
 
+/* Defined in redis_pool.c (TrueAsync connection pool). Named *_async_pool to
+ * avoid colliding with the session-side redis_pool in redis_session.c. */
+typedef struct _redis_async_pool redis_async_pool;
+
 typedef struct {
     RedisSock *sock;
+    redis_async_pool *pool;   /* NULL unless pool mode is enabled */
     zend_object std;
 } redis_object;
 

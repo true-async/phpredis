@@ -43,6 +43,7 @@
 #endif
 
 #include "library.h"
+#include "redis_pool.h"
 
 #ifdef HAVE_REDIS_ZSTD
 #include <zstd.h>
@@ -198,6 +199,8 @@ free_redis_object(zend_object *object)
 {
     redis_object *redis = PHPREDIS_GET_OBJECT(redis_object, object);
 
+    redis_pool_destroy(redis);
+
     zend_object_std_dtor(&redis->std);
     if (redis->sock) {
         redis_sock_disconnect(redis->sock, 0, 1);
@@ -274,6 +277,15 @@ PHP_REDIS_API RedisSock *
 redis_sock_get(zval *id, int no_throw)
 {
     RedisSock *redis_sock;
+
+    /* Pool mode: hand the current coroutine its checked-out connection
+     * instead of the object's (unopened) template socket. */
+    if (Z_TYPE_P(id) == IS_OBJECT) {
+        redis_object *obj = PHPREDIS_ZVAL_GET_OBJECT(redis_object, id);
+        if (obj->pool != NULL) {
+            return redis_pool_acquire_conn(obj, no_throw);
+        }
+    }
 
     if ((redis_sock = redis_sock_get_instance(id, no_throw)) == NULL) {
         return NULL;
@@ -488,6 +500,9 @@ PHP_METHOD(Redis, __construct)
     if (opts != NULL && redis_sock_configure(redis->sock, opts) != SUCCESS) {
         RETURN_THROWS();
     }
+    if (redis_pool_create(redis, opts) != SUCCESS) {
+        RETURN_THROWS();
+    }
 }
 /* }}} */
 
@@ -699,6 +714,8 @@ redis_process_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_cmd_cb cmd_cb,
     } else {
         REDIS_PROCESS_RESPONSE_CLOSURE(resp_cb, ctx);
     }
+
+    redis_pool_maybe_release(getThis());
 }
 
 #define REDIS_PROCESS_CMD(cmdname, resp_func) \
@@ -734,6 +751,8 @@ redis_process_kw_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *kw,
     } else {
         REDIS_PROCESS_RESPONSE_CLOSURE(resp_cb, ctx);
     }
+
+    redis_pool_maybe_release(getThis());
 }
 
 /* {{{ proto long Redis::bitop(string op, string key, ...) */
