@@ -102,7 +102,7 @@ Mirror `pdo_pool_binding_t` / the `pdo_dbh_t` pool fields.
 /* Per-coroutine binding. Analogue of pdo_pool_binding_t. */
 typedef struct {
     zend_async_event_callback_t event;  /* coroutine-finalize callback */
-    redis_async_pool *rp;               /* owning pool, NULL once destroyed */
+    redis_async_pool *pool;             /* owning pool, NULL once destroyed */
     RedisSock        *conn;             /* checked-out conn, or NULL */
     zend_ulong        coro_key;
     bool              has_coro_callback;
@@ -113,7 +113,6 @@ struct _redis_async_pool {
     zend_async_pool_t *async_pool;      /* physical RedisSock resources */
     HashTable         *bindings;        /* coro_key -> redis_pool_binding_t* */
     HashTable         *opts;            /* dup'd ctor options; factory replays */
-    zend_object       *wrapper;         /* PHP pool wrapper (getPool()), lazy */
     long               db_default;      /* configured DB; drift pins the conn */
     uint32_t           mux_reserve;     /* connections reserved for multiplexing */
 };

@@ -29,9 +29,9 @@ extern zend_class_entry *redis_exception_ce;
  */
 typedef struct {
 	zend_async_event_callback_t event;  /* must be first for the callback cast */
-	redis_async_pool *rp;               /* owning pool, NULL once destroyed */
+	redis_async_pool *pool;             /* owning pool, NULL once destroyed */
 	RedisSock   *conn;                  /* checked-out conn, NULL if released */
-	zend_ulong   coro_key;              /* key in rp->bindings */
+	zend_ulong   coro_key;              /* key in pool->bindings */
 	bool         has_coro_callback;     /* registered with the coroutine event */
 } redis_pool_binding_t;
 
@@ -39,7 +39,6 @@ struct _redis_async_pool {
 	zend_async_pool_t *async_pool;      /* physical RedisSock resources */
 	HashTable         *bindings;        /* coro_key -> redis_pool_binding_t* */
 	HashTable         *opts;            /* dup'd ctor options; factory re-applies */
-	zend_object       *wrapper;         /* PHP pool wrapper (getPool()), lazy */
 	long               db_default;      /* configured DB; drift pins the conn */
 	uint32_t           mux_reserve;     /* connections reserved for multiplexing */
 };
@@ -205,19 +204,19 @@ static void redis_pool_binding_on_coroutine_finish(
 	redis_pool_binding_t *binding = (redis_pool_binding_t *)callback;
 
 	/* Pool already destroyed — nothing to do. */
-	if (binding->rp == NULL) {
+	if (binding->pool == NULL) {
 		return;
 	}
 
 	if (binding->conn != NULL) {
 		zval conn_zval;
 		ZVAL_PTR(&conn_zval, binding->conn);
-		ZEND_ASYNC_POOL_RELEASE(binding->rp->async_pool, &conn_zval);
+		ZEND_ASYNC_POOL_RELEASE(binding->pool->async_pool, &conn_zval);
 		binding->conn = NULL;
 	}
 
-	if (binding->rp->bindings != NULL) {
-		zend_hash_index_del(binding->rp->bindings, binding->coro_key);
+	if (binding->pool->bindings != NULL) {
+		zend_hash_index_del(binding->pool->bindings, binding->coro_key);
 	}
 }
 
@@ -300,7 +299,6 @@ int redis_pool_create(redis_object *redis, HashTable *opts)
 	rp->opts = zend_array_dup(opts);
 	rp->db_default = redis->sock ? redis->sock->dbNumber : 0;
 	rp->mux_reserve = (uint32_t)mux;
-	rp->wrapper = NULL;
 
 	redis->pool = rp;
 	return SUCCESS;
@@ -329,18 +327,13 @@ void redis_pool_destroy(redis_object *redis)
 				efree(binding);
 			} else {
 				/* Coroutine callback will no-op; dispose frees the binding. */
-				binding->rp = NULL;
+				binding->pool = NULL;
 			}
 		} ZEND_HASH_FOREACH_END();
 
 		zend_hash_destroy(rp->bindings);
 		efree(rp->bindings);
 		rp->bindings = NULL;
-	}
-
-	if (rp->wrapper != NULL) {
-		OBJ_RELEASE(rp->wrapper);
-		rp->wrapper = NULL;
 	}
 
 	if (rp->async_pool != NULL) {
@@ -397,7 +390,7 @@ RedisSock *redis_pool_acquire_conn(redis_object *redis, int no_throw)
 	binding->event.callback = redis_pool_binding_on_coroutine_finish;
 	binding->event.dispose = redis_pool_binding_dispose;
 	binding->event.ref_count = 1;
-	binding->rp = rp;
+	binding->pool = rp;
 	binding->conn = Z_PTR(resource);
 	binding->coro_key = coro_key;
 

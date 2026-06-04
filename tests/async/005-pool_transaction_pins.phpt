@@ -20,7 +20,7 @@ $co = spawn(function() use ($redis, $k) {
     $redis->set($k, 'a');
     $redis->append($k, 'b');
     $redis->get($k);
-    $res = $redis->exec();        // транзакция атомарна на одном соединении
+    $res = $redis->exec();        // transaction is atomic on a single connection
     $redis->del($k);
     return $res;
 });

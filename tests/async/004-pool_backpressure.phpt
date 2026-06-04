@@ -12,24 +12,24 @@ require_once __DIR__ . '/inc/async_redis_pool_test.inc';
 use function Async\spawn;
 use function Async\await;
 
-/* Порт ext/async/tests/pool/029: при max=1 второй потребитель обязан
- * запарковаться, пока первый держит соединение (в транзакции — пиннинг). */
+/* Port of ext/async/tests/pool/029: with max=1 the second consumer must park
+ * while the first holds the connection (pinned by the transaction). */
 $redis = AsyncRedisPoolTest::poolFactory(max: 1);
 $k = AsyncRedisPoolTest::key('bp');
 
 $c2Blocked = false;
 
 $c1 = spawn(function() use ($redis, $k) {
-    $redis->multi();              // пиннит единственное соединение
+    $redis->multi();              // pins the only connection
     $redis->set($k, '1');
     \Async\suspend();
     \Async\suspend();
-    $redis->exec();               // отпускает соединение в пул
+    $redis->exec();               // releases the connection back to the pool
 });
 
 $c2 = spawn(function() use ($redis, $k, &$c2Blocked) {
     $c2Blocked = ($redis->getPool()->idleCount() === 0);
-    $v = $redis->get($k);         // ждёт, пока c1 не освободит conn
+    $v = $redis->get($k);         // waits until c1 frees the conn
     $redis->del($k);
     return $v;
 });

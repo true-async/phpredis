@@ -1,5 +1,5 @@
 <?php
-/* Хелпер для async pool тестов phpredis. По образцу
+/* Helper for phpredis async pool tests. Modeled on
  * php-src/ext/async/tests/pdo_mysql/inc/async_pdo_mysql_test.inc */
 
 use function Async\spawn;
@@ -10,21 +10,21 @@ class AsyncRedisPoolTest
     static function host(): string { return getenv('REDIS_TEST_HOST') ?: '127.0.0.1'; }
     static function port(): int    { return (int)(getenv('REDIS_TEST_PORT') ?: 6379); }
 
-    /* Скип, если TrueAsync-рантайм недоступен. */
+    /* Skip if the TrueAsync runtime is unavailable. */
     static function skipIfNoAsync(): void {
         if (!function_exists('Async\\spawn')) {
             die("skip TrueAsync runtime not available\n");
         }
     }
 
-    /* Скип, если расширение redis не загружено. */
+    /* Skip if the redis extension is not loaded. */
     static function skipIfNoRedis(): void {
         if (!extension_loaded('redis')) {
             die("skip redis extension not loaded\n");
         }
     }
 
-    /* Скип, если живой Redis недоступен. */
+    /* Skip if no live Redis server is reachable. */
     static function skipIfNoServer(): void {
         $r = new Redis();
         if (!@$r->connect(self::host(), self::port(), 1.0)) {
@@ -39,7 +39,7 @@ class AsyncRedisPoolTest
         self::skipIfNoServer();
     }
 
-    /* Pool-enabled Redis (template-режим). Конфиг пула — см. TRUE_ASYNC_POOL.md §6. */
+    /* Pool-enabled Redis (template mode). Pool config — see TRUE_ASYNC_POOL.md §6. */
     static function poolFactory(int $max = 4, int $mux = 0, int $min = 0): Redis {
         return new Redis([
             'host' => self::host(),
@@ -53,7 +53,7 @@ class AsyncRedisPoolTest
         ]);
     }
 
-    /* Уникальный префикс ключей, чтобы тесты не топтали друг друга. */
+    /* Unique key prefix so tests do not clobber each other. */
     static function key(string $name): string {
         return 'phpredis:async:test:' . $name;
     }

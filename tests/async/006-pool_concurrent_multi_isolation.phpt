@@ -12,8 +12,8 @@ require_once __DIR__ . '/inc/async_redis_pool_test.inc';
 use function Async\spawn;
 use function Async\await;
 
-/* Две корутины ведут транзакции параллельно. Каждая пиннит СВОЁ физическое
- * соединение (нужно max>=2), команды не перемешиваются между транзакциями. */
+/* Two coroutines run transactions in parallel. Each pins its OWN physical
+ * connection (needs max>=2); commands do not interleave between transactions. */
 $redis = AsyncRedisPoolTest::poolFactory(max: 2);
 
 $mk = function(string $tag) use ($redis) {
@@ -21,7 +21,7 @@ $mk = function(string $tag) use ($redis) {
         $k = AsyncRedisPoolTest::key("iso:$tag");
         $redis->multi();
         $redis->set($k, $tag);
-        \Async\suspend();              // отдаём управление другой корутине
+        \Async\suspend();              // yield to the other coroutine
         $redis->append($k, $tag);
         $out = $redis->exec();
         $v = $redis->get($k);
@@ -36,8 +36,8 @@ $b = spawn($mk('B'));
 $va = await($a);
 $vb = await($b);
 
-echo "A: $va\n";   // должно быть "AA", не перемешано с B
-echo "B: $vb\n";   // должно быть "BB"
+echo "A: $va\n";   // must be "AA", not mixed with B
+echo "B: $vb\n";   // must be "BB"
 echo "Done\n";
 ?>
 --EXPECT--

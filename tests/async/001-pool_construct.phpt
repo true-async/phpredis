@@ -13,7 +13,7 @@ $redis = AsyncRedisPoolTest::poolFactory(max: 4);
 $pool  = $redis->getPool();
 
 echo "Has pool: " . ($pool !== null ? "yes" : "no") . "\n";
-echo "Count: "  . $pool->count() . "\n";      // ещё ничего не выдано
+echo "Count: "  . $pool->count() . "\n";      // nothing handed out yet
 echo "Idle: "   . $pool->idleCount() . "\n";
 echo "Active: " . $pool->activeCount() . "\n";
 echo "Done\n";

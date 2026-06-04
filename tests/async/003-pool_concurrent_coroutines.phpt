@@ -14,8 +14,8 @@ use function Async\await;
 
 $redis = AsyncRedisPoolTest::poolFactory(max: 4);
 
-/* Инвариант (chaos-стиль): при любой интерливинге каждая корутина читает
- * именно своё значение — общий $redis не перемешивает ответы. */
+/* Invariant (chaos-style): under any interleaving each coroutine reads its own
+ * value — the shared $redis never mixes up replies. */
 $N = 8;
 $coros = [];
 for ($i = 0; $i < $N; $i++) {
