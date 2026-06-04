@@ -456,6 +456,38 @@ fallback for MULTI/SUB/BLPOP, broken mux socket, implicit pipelining.
 
 ---
 
+## 9a. Technical debt — multiplex reply framing
+
+The RESP frame scanner (`redis_resp_frame_len`) is correct for well-formed
+RESP2/RESP3 (unit-tested, 21 cases) and efficient on the common path — small
+replies, and large bulk *strings* whose bodies are skipped arithmetically
+(`total = header + len + 2`, no body walk). A single scan costs O(structure)
+(element count + short headers), not O(payload). Known debt, to clear before the
+multiplex path ships or as profiling dictates:
+
+1. **O(elements²) re-scan of large aggregates under fragmentation.** The scanner
+   is stateless and restarts at byte 0 on every `recv`, so a large multibulk
+   (big `MGET`/`LRANGE`/`HGETALL`) delivered in chunks re-walks the
+   already-arrived elements each time. Large bulk strings are unaffected.
+   - Cheap mitigation (in the pump): keep a `frame_start` offset and never
+     re-scan an already-completed reply — removes the O(N²) *between* replies in
+     a multi-reply read.
+   - Full fix: a resumable parser (saved position + a stack of remaining element
+     counts), like hiredis, so a single large aggregate is never re-walked. Do
+     this only if profiling shows large fragmented multibulks matter.
+2. **No recursion-depth cap (stack-overflow DoS).** `resp_scan` recurses per
+   nesting level; a pathological/hostile deeply nested reply overflows the C
+   stack. Add a depth cap (e.g. 128 → protocol error). Low likelihood (trusted
+   server) but defense-in-depth.
+3. **No length bound (lane wedge).** `resp_int_line` parses the length field
+   with no overflow/sanity check; a malformed huge length makes the scanner
+   keep returning 0, wedging the lane on bytes that never arrive. Reject `n`
+   beyond a sane maximum (>= 512 MiB) → protocol error.
+4. **Micro:** `resp_line_end` scans for `\r\n` byte-by-byte; `memchr` is faster,
+   but the lines here are short headers, so the gain is marginal. Low priority.
+
+---
+
 ## 10. References
 
 - PDO pool (the reference): `php-src/ext/pdo/pdo_pool.{c,h}`, `pdo_dbh.c`.
