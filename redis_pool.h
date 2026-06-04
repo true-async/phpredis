@@ -28,6 +28,11 @@ void redis_pool_destroy(redis_object *redis);
  * userland must GC_ADDREF it. */
 zend_object *redis_pool_get_wrapper(redis_object *redis);
 
+/* True when a built command (raw RESP bytes) may ride the shared multiplexed
+ * socket; false for stateful/blocking/connection-rebinding commands that must
+ * take a private checkout connection. */
+bool redis_cmd_is_multiplexable(const char *cmd, int cmd_len);
+
 /*
  * Per-coroutine checkout. Returns a READY RedisSock or NULL on failure
  * (throws unless no_throw). Reuses the coroutine's pinned connection when one

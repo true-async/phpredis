@@ -277,57 +277,84 @@ Per multiplexed socket (`redis_mux_t`):
 - A write baton / out-buffer to serialize concurrent writes (and optionally
   batch frames before flush → pipelining).
 
-### 5.2 Dispatch (mux extension of `redis_sock_get`)
+There are `mux` lanes (default small; 2 is a practical ceiling). A command is
+assigned to the lane with the fewest in-flight replies (`argmin(in_flight)`,
+tie-break round-robin). The choice is committed at send time — the reply returns
+on that lane (Redis preserves order per connection). No per-coroutine lane
+affinity is needed: in mux mode a coroutine has at most one command in flight
+(its synchronous code awaits each reply before issuing the next).
+
+### 5.2 Dispatch (in the generic command dispatchers)
+
+The decision lives in `redis_process_cmd` / `redis_process_kw_cmd`, where the
+command is built, not in `redis_sock_get` (which runs before the command is
+known). The command kind is read from the built RESP bytes:
 
 ```
-redis_sock_get(obj):
-    if !pool: return obj->sock
-    binding = bindings[coro_key]
-    if binding && binding->conn: return binding->conn        # already pinned (checkout)
-    if mux && redis_cmd_is_multiplexable(state, cmd): MUX path (§5.3)
-    return redis_pool_acquire_conn(obj)                      # checkout
+redis_process_cmd(obj, cmd_cb, resp_cb):
+    if pool && mux_enabled && coro has no pinned conn:
+        cmd_cb(template_sock, &cmd, &cmd_len)               # build the RESP frame
+        if redis_cmd_is_multiplexable(cmd, cmd_len):        # parse name from bytes
+            return redis_mux_dispatch(pool, cmd, cmd_len, resp_cb, ctx)   # §5.3
+        # not multiplexable -> checkout with the already-built cmd
+        sock = redis_pool_acquire_conn(obj); write; read; return
+    ... existing checkout/normal path ...
 ```
 
-`redis_cmd_is_multiplexable` excludes `SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE, MULTI,
-WATCH, BLPOP/BRPOP/BLMOVE/BLMPOP/BZPOP*, WAIT/WAITAOF, SELECT/SWAPDB, MONITOR`
-and any non-atomic / watching / subscribed state.
+`redis_cmd_is_multiplexable` parses the command name from the wire bytes
+(`*argc\r\n$len\r\nNAME\r\n…`) and rejects `MULTI/EXEC/DISCARD/WATCH/UNWATCH,
+SUBSCRIBE*/UNSUBSCRIBE*, BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/BZPOP*/BZMPOP,
+WAIT/WAITAOF, SELECT/SWAPDB, MONITOR, RESET`. A coroutine that already holds a
+pinned checkout connection (mid stateful sequence) keeps using it.
 
 ### 5.3 Command flow (mux mode)
 
-A coroutine issuing a multiplexable command:
+Send (coroutine side), all in one synchronous step — no await between appending
+bytes and registering the waiter, so FIFO order == wire order:
 
-1. Serialize its RESP frame.
-2. Write it to the shared socket under the write baton (or append to the
-   out-buffer for batched flush — implicit pipelining).
-3. Push a waiter `{ awaitable, resp_cb, ctx }` into the channel ring buffer.
-4. Ensure `read_ev` is started.
-5. Park on its awaitable (suspend).
+1. Append the built RESP frame to the chosen lane's out-buffer.
+2. Register a waiter `{ awaitable, resp_cb, ctx, reply_frame slot }` at the tail
+   of that lane's FIFO; `in_flight++`.
+3. Optimistic non-blocking write of the out-buffer; on partial write/`EAGAIN`,
+   keep the remainder and arm the WRITABLE event. Batching many coroutines'
+   frames into one writev = implicit pipelining.
+4. Ensure the READABLE event is armed; park on the awaitable.
 
-### 5.4 Reply pump (C callback — the heart of Stage 2)
+### 5.4 Reply pump — split: I/O+framing in C, materialization in the coroutine
 
-Fires on **socket-readable** (`read_ev`) and on **channel push** (drain
-immediately in case a reply is already buffered). Runs between coroutines:
+The READABLE C callback does **only non-blocking I/O and RESP framing** — never
+parks, never materializes zvals:
 
 ```
-redis_mux_pump(mux):
-    n = non_blocking_read(sock, parse_buf)        # poll/recv, NEVER parks
-    if n == EOF or error: fail_all_waiters(mux); teardown(mux); return
-    while parse_buf holds a complete RESP reply:
-        waiter = channel_pop_front(mux->channel)  # FIFO order == reply order
-        run waiter.resp_cb on the reply -> waiter result
-        ZEND_ASYNC_CALLBACKS_NOTIFY(waiter.awaitable, result, NULL)  # resume coroutine
-    if channel is empty: read_ev.stop()
+redis_mux_pump(lane):                              # reactor C callback, between coroutines
+    n = recv_nonblocking(lane->sock, lane->in_buf)
+    if n == EOF/error: fail all waiters; teardown lane; return
+    while a complete RESP reply is framed in lane->in_buf:   # byte-boundary scan only
+        frame  = detach next reply bytes
+        waiter = fifo_pop_front(lane); lane->in_flight--
+        waiter->reply_frame = frame
+        ZEND_ASYNC_CALLBACKS_NOTIFY(waiter->awaitable, NULL, NULL)   # resume coroutine
+    if fifo empty: READABLE.stop()
 ```
 
-The originating coroutine wakes with its own reply. Because Redis preserves
-reply order on a connection, FIFO pop matches replies to requests with no
-correlation IDs.
+The resumed coroutine — back in its own `redis_process_cmd` frame, where
+`return_value`/`execute_data` are valid — materializes the reply by pointing a
+RedisSock at a **memory stream over `reply_frame`** and running the ordinary
+atomic `resp_cb` (which reads via `redis_sock->stream` and writes
+`return_value`). This reuses phpredis's full reply parser/serializers unchanged;
+the pump only needs a lightweight RESP frame-boundary scanner.
 
-### 5.5 Degrade to checkout
+So reads happen in the C callback (no dedicated reader coroutine, no blocking);
+only the cheap byte-copy materialization runs per coroutine, where the result
+must land anyway.
 
-A non-multiplexable command, or a mux socket marked broken, transparently falls
-back to `redis_pool_acquire_conn` (Stage 1). Stateful scenarios
-(MULTI/SUB/BLPOP) always run on a personal connection.
+### 5.5 Backpressure & degrade to checkout
+
+Backpressure parks the producer: a bounded in-flight FIFO (caps pipeline depth)
+and an out-buffer high-water mark (caps unsent bytes) both suspend the sending
+coroutine until the lane drains. A non-multiplexable command, or a lane marked
+broken, transparently falls back to `redis_pool_acquire_conn` (Stage 1);
+stateful sequences (MULTI/SUB/BLPOP/SELECT) always run on a private connection.
 
 ---
 
@@ -380,11 +407,15 @@ pool, released on destroy.
       transaction pin, MULTI isolation, getPool introspection) — all green.
 
 ### Stage 2 — multiplex queue
-- [ ] `redis_cmd_is_multiplexable` classifier.
-- [ ] `redis_mux_t`: write baton, channel ring buffer, READABLE poll event.
-- [ ] Reply pump: non-blocking drain, FIFO match, `ZEND_ASYNC_CALLBACKS_NOTIFY`.
-- [ ] Write batching (implicit pipelining) + flush strategy.
-- [ ] Degrade to checkout for non-multiplexable / broken sockets.
+- [x] `redis_cmd_is_multiplexable` classifier (command name parsed from RESP bytes).
+- [ ] `redis_mux_t` lanes: out-buffer, waiter FIFO, in-flight counter,
+      READABLE/WRITABLE poll events; `argmin(in_flight)` lane selection.
+- [ ] RESP frame-boundary scanner (non-blocking, partial-frame safe).
+- [ ] Reply pump: recv + frame + FIFO pop + `ZEND_ASYNC_CALLBACKS_NOTIFY`.
+- [ ] Coroutine-side materialization via memory-stream + atomic `resp_cb`.
+- [ ] Write path: optimistic non-blocking write + WRITABLE drain + batching.
+- [ ] Dispatch in `redis_process_cmd`/`_kw_cmd`; degrade to checkout.
+- [ ] Backpressure: bounded FIFO + out-buffer high-water park the producer.
 - [ ] Tests: reply ordering under interleaving, fallback, broken socket, batching.
 
 ---
