@@ -33,6 +33,10 @@ zend_object *redis_pool_get_wrapper(redis_object *redis);
  * take a private checkout connection. */
 bool redis_cmd_is_multiplexable(const char *cmd, int cmd_len);
 
+/* Length of one complete RESP reply at buf[0..len), or 0 when more bytes are
+ * needed. Used by the multiplex reply pump for frame boundaries. */
+size_t redis_resp_frame_len(const char *buf, size_t len);
+
 /*
  * Per-coroutine checkout. Returns a READY RedisSock or NULL on failure
  * (throws unless no_throw). Reuses the coroutine's pinned connection when one

@@ -408,9 +408,10 @@ pool, released on destroy.
 
 ### Stage 2 — multiplex queue
 - [x] `redis_cmd_is_multiplexable` classifier (command name parsed from RESP bytes).
+- [x] RESP frame-boundary scanner (`redis_resp_frame_len`; RESP2/RESP3, nesting,
+      attributes, partial-frame safe; unit-tested across 21 cases).
 - [ ] `redis_mux_t` lanes: out-buffer, waiter FIFO, in-flight counter,
       READABLE/WRITABLE poll events; `argmin(in_flight)` lane selection.
-- [ ] RESP frame-boundary scanner (non-blocking, partial-frame safe).
 - [ ] Reply pump: recv + frame + FIFO pop + `ZEND_ASYNC_CALLBACKS_NOTIFY`.
 - [ ] Coroutine-side materialization via memory-stream + atomic `resp_cb`.
 - [ ] Write path: optimistic non-blocking write + WRITABLE drain + batching.

@@ -148,6 +148,123 @@ bool redis_cmd_is_multiplexable(const char *cmd, int cmd_len)
 	return true;
 }
 
+/*
+ * RESP frame-boundary scanner (non-blocking, partial-frame safe).
+ *
+ * Used by the multiplex reply pump to detect a complete reply in a buffer
+ * without materializing it: the pump only needs the byte boundary, the resumed
+ * coroutine then runs phpredis's normal parser over the framed bytes.
+ */
+
+/* Offset just past the first \r\n at or after `from`, or 0 if no complete line. */
+static size_t resp_line_end(const char *buf, size_t len, size_t from)
+{
+	for (size_t i = from; i + 1 < len; i++) {
+		if (buf[i] == '\r' && buf[i + 1] == '\n') {
+			return i + 2;
+		}
+	}
+
+	return 0;
+}
+
+/* Parse the (possibly negative) integer header between `from` and \r\n. On
+ * success sets *out and returns the offset past \r\n; 0 if the line is partial. */
+static size_t resp_int_line(const char *buf, size_t len, size_t from, long *out)
+{
+	size_t end = resp_line_end(buf, len, from);
+	if (end == 0) {
+		return 0;
+	}
+
+	long sign = 1, n = 0;
+	size_t i = from;
+
+	if (buf[i] == '-') {
+		sign = -1;
+		i++;
+	} else if (buf[i] == '+') {
+		i++;
+	}
+
+	for (; i + 2 <= end; i++) {
+		const char c = buf[i];
+		if (c < '0' || c > '9') {
+			break;
+		}
+		n = n * 10 + (c - '0');
+	}
+
+	*out = sign * n;
+	return end;
+}
+
+/* Length of one complete RESP value at buf[0..len), or 0 if more bytes are
+ * needed. Handles RESP2 and RESP3 (maps/sets/push/attributes); an attribute is
+ * transparent — it is consumed together with the reply it prefixes. */
+static size_t resp_scan(const char *buf, size_t len)
+{
+	if (len < 1) {
+		return 0;
+	}
+
+	switch (buf[0]) {
+		case '+': case '-': case ':': case '_': case ',': case '#': case '(':
+			return resp_line_end(buf, len, 1);
+
+		case '$': case '=': {
+			long n;
+			size_t hdr = resp_int_line(buf, len, 1, &n);
+			if (hdr == 0) {
+				return 0;
+			}
+			if (n < 0) {
+				return hdr;
+			}
+			size_t total = hdr + (size_t)n + 2;
+			return total <= len ? total : 0;
+		}
+
+		case '*': case '~': case '>': case '%': case '|': {
+			long n;
+			size_t off = resp_int_line(buf, len, 1, &n);
+			if (off == 0) {
+				return 0;
+			}
+			if (n < 0) {
+				return off;
+			}
+
+			size_t elems = (buf[0] == '%' || buf[0] == '|') ? (size_t)n * 2 : (size_t)n;
+			for (size_t e = 0; e < elems; e++) {
+				size_t c = resp_scan(buf + off, len - off);
+				if (c == 0) {
+					return 0;
+				}
+				off += c;
+			}
+
+			if (buf[0] == '|') {
+				size_t c = resp_scan(buf + off, len - off);
+				if (c == 0) {
+					return 0;
+				}
+				off += c;
+			}
+
+			return off;
+		}
+
+		default:
+			return resp_line_end(buf, len, 1);
+	}
+}
+
+size_t redis_resp_frame_len(const char *buf, size_t len)
+{
+	return resp_scan(buf, len);
+}
+
 /* Close and free a pooled connection. */
 static void redis_pool_free_conn(RedisSock *sock)
 {
