@@ -9,7 +9,12 @@ best of both worlds.
 - **Stage 1 (checkout pool): implemented & tested.** `redis_pool.{c,h}`, wired
   into the command path; concurrent coroutines, transaction pinning and
   concurrent-MULTI isolation pass under ASAN.
-- **Stage 2 (multiplexing): designed, not yet implemented.** See §5.
+- **Stage 2 (multiplexing): working (v0).** The mux command path is implemented
+  and verified — concurrent commands over shared lanes return correct, correctly
+  ordered replies under interleaving, with no per-operation leaks (ASAN). v0
+  caveats: plain TCP only (no SSL on the lane), blocking write baton (no WRITABLE
+  drain/backpressure yet), a one-time reactor-loop teardown leak (§9a), and no
+  `.phpt` coverage yet. See §5.
 
 ---
 
@@ -361,6 +366,46 @@ coroutine until the lane drains. A non-multiplexable command, or a lane marked
 broken, transparently falls back to `redis_pool_acquire_conn` (Stage 1);
 stateful sequences (MULTI/SUB/BLPOP/SELECT) always run on a private connection.
 
+### 5.6 Walkthrough — a `$redis->get('x')` over mux
+
+The concrete end-to-end flow (implemented and working; see Status):
+
+1. **Dispatch** (`redis_process_cmd`): build the command bytes
+   (`*2\r\n$3\r\nGET\r\n$1\r\nx\r\n`) using the template socket's serializer.
+   Gate on `redis_pool_should_mux` (pool + mux, in a coroutine, no pinned conn)
+   and `redis_cmd_is_multiplexable` (GET → yes).
+2. **Pick a lane** (`redis_mux_pick`): `argmin(in_flight)` across the lanes,
+   lazily opening the socket (and its READABLE poll event → pump) on first use.
+3. **Register a waiter**: a `zend_future_t` plus a FIFO node pushed at the lane's
+   tail; `in_flight++`. The FIFO order is the wire order.
+4. **Write** (`redis_mux_flush`): append the bytes to `out_buf`; the write-baton
+   holder flushes them. Concurrent senders just append → one batched write =
+   implicit pipelining.
+5. **Arm READABLE**: start the lane poll event so the reactor invokes the pump
+   when replies arrive.
+6. **Await** (`redis_mux_await`): the coroutine suspends on its Future; control
+   returns to the scheduler and other coroutines pile their commands onto the
+   same lane.
+7. **Reply pump** (`redis_mux_pump`, a reactor C callback firing on socket
+   readability, between coroutines): non-blocking `recv` into `in_buf`; for each
+   complete RESP frame (`redis_resp_frame_len`) pop the FIFO head waiter (in
+   order) and `ZEND_FUTURE_COMPLETE(future, frame)` → resolves the Future →
+   resumes that coroutine.
+8. **Materialize** (back in the resumed coroutine): wrap the frame in a read-only
+   memory stream and run the ordinary atomic `resp_cb` → `return_value`.
+
+Reply matching needs no correlation IDs: steps 3–6 fix the order, step 7 hands
+replies out FIFO, and Redis guarantees reply order within a connection.
+
+```
+coroutines A,B,C  →  GET on one lane
+   write:  [cmdA][cmdB][cmdC]   ── one batched write (pipeline)
+   wire ←  replyA  replyB  replyC       (in order)
+   pump:   replyA → FIFO.pop = A → wake A
+           replyB → FIFO.pop = B → wake B
+           replyC → FIFO.pop = C → wake C
+```
+
 ---
 
 ## 6. PHP-level API
@@ -417,12 +462,13 @@ pool, released on destroy.
       attributes, partial-frame safe; unit-tested across 21 cases).
 - [x] `redis_mux_t` lane struct + waiter (a `zend_future_t`) + lane array on the
       pool + lifecycle (lazy slots, teardown). ASAN-clean construct/destroy.
-- [ ] Lazy lane open + `argmin(in_flight)` selection.
-- [ ] Reply pump: recv + frame + FIFO pop + `ZEND_ASYNC_CALLBACKS_NOTIFY`.
-- [ ] Coroutine-side materialization via memory-stream + atomic `resp_cb`.
-- [ ] Write path: optimistic non-blocking write + WRITABLE drain + batching.
-- [ ] Dispatch in `redis_process_cmd`/`_kw_cmd`; degrade to checkout.
-- [ ] Backpressure: bounded FIFO + out-buffer high-water park the producer.
+- [x] Lazy lane open + `argmin(in_flight)` selection.
+- [x] Reply pump: recv + frame + FIFO pop + `ZEND_FUTURE_COMPLETE`.
+- [x] Coroutine-side materialization via memory-stream + atomic `resp_cb`.
+- [x] Dispatch in `redis_process_cmd`/`_kw_cmd`; degrade to checkout.
+- [~] Write path: v0 blocking write baton + batching (WRITABLE drain TODO, §9b).
+- [ ] Backpressure: bounded FIFO + out-buffer high-water park the producer (§9b).
+- [ ] Lane teardown leak fix (§9b) + broken-lane recovery + TLS on lanes.
 - [ ] Tests: reply ordering under interleaving, fallback, broken socket, batching.
 
 ---
@@ -491,6 +537,24 @@ multiplex path ships or as profiling dictates:
    beyond a sane maximum (>= 512 MiB) → protocol error.
 4. **Micro:** `resp_line_end` scans for `\r\n` byte-by-byte; `memchr` is faster,
    but the lines here are short headers, so the gain is marginal. Low priority.
+
+### 9b. Technical debt — multiplex v0
+
+5. **Lane teardown leak (reactor loop).** A lane's READABLE poll event keeps the
+   libuv loop alive at process shutdown: lanes are freed during object teardown
+   (`free_redis_object` → `redis_pool_destroy`), past the reactor's final
+   close-drain, so the deferred `uv_close` never completes. One-time and
+   non-growing (constant 2 allocations regardless of command count); the
+   per-operation path is leak-clean. Checkout connections (php_stream-managed) do
+   not hit this — only the explicit `ZEND_ASYNC_NEW_SOCKET_EVENT` does. Fix needs
+   closing lanes within the reactor-active phase (a pool-close/shutdown hook).
+6. **Blocking write baton, no backpressure.** v0 flushes `out_buf` with blocking
+   `php_stream_write`; there is no WRITABLE-drain path nor an in-flight/out-buffer
+   high-water mark yet (§5.3/§5.5).
+7. **Plain TCP only.** The pump reads via raw `recv(MSG_DONTWAIT)`, bypassing the
+   stream filters — TLS on a mux lane is not supported in v0.
+8. **Single-lane teardown of pending waiters.** A broken lane must fail its
+   in-flight futures and fall back to checkout (§5.5) — not yet implemented.
 
 ---
 

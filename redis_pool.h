@@ -37,6 +37,16 @@ bool redis_cmd_is_multiplexable(const char *cmd, int cmd_len);
  * needed. Used by the multiplex reply pump for frame boundaries. */
 size_t redis_resp_frame_len(const char *buf, size_t len);
 
+/* True when the current command should ride a multiplex lane: mux is enabled,
+ * we are in a coroutine, and it holds no pinned checkout connection. */
+bool redis_pool_should_mux(redis_object *redis);
+
+/* Run a built command over a shared multiplex lane: enqueue, write, await the
+ * reply and materialize it into return_value. Takes ownership of `cmd` (frees
+ * it). Must be called from a coroutine on a multiplexable command. */
+void redis_mux_dispatch(redis_object *redis, char *cmd, int cmd_len,
+	FailableResultCallback resp_cb, void *ctx, INTERNAL_FUNCTION_PARAMETERS);
+
 /*
  * Per-coroutine checkout. Returns a READY RedisSock or NULL on failure
  * (throws unless no_throw). Reuses the coroutine's pinned connection when one

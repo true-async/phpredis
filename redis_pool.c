@@ -19,6 +19,12 @@
 #include "redis_pool.h"
 #include "Zend/zend_async_API.h"
 #include "zend_exceptions.h"
+#include "php_streams.h"
+#include "php_network.h"
+#include "ext/standard/php_smart_string.h"
+#ifdef HAVE_SYS_SOCKET_H
+#include <sys/socket.h>
+#endif
 
 extern zend_class_entry *redis_exception_ce;
 
@@ -59,6 +65,7 @@ typedef struct _redis_mux {
 	zend_async_poll_event_t *write_ev;  /* WRITABLE; armed only while out_buf has bytes */
 	smart_string      out_buf;          /* pending outbound bytes (batched) */
 	smart_string      in_buf;           /* inbound bytes awaiting framing */
+	bool              writing;          /* a coroutine is flushing out_buf (write baton) */
 } redis_mux_t;
 
 struct _redis_async_pool {
@@ -313,6 +320,9 @@ static void redis_mux_lane_free(redis_mux_t *lane)
 		return;
 	}
 
+	/* TODO(mux teardown leak): a lane's READABLE poll event keeps the reactor
+	 * loop alive at process shutdown (uv_close is deferred and not drained when
+	 * lanes are freed during object teardown). One-time, non-growing; see §9a. */
 	if (lane->read_ev != NULL) {
 		lane->read_ev->base.stop(&lane->read_ev->base);
 		lane->read_ev->base.dispose(&lane->read_ev->base);
@@ -327,6 +337,256 @@ static void redis_mux_lane_free(redis_mux_t *lane)
 	smart_string_free(&lane->in_buf);
 	redis_pool_free_conn(lane->sock);
 	efree(lane);
+}
+
+/*
+ * Multiplex command path (v0: single lane, plain TCP).
+ */
+
+/* Underlying socket fd of a lane (for non-blocking recv in the pump). */
+static php_socket_t redis_mux_fd(RedisSock *sock)
+{
+	php_socket_t fd = -1;
+
+	if (sock->stream == NULL) {
+		return -1;
+	}
+
+	php_stream_cast(sock->stream, PHP_STREAM_AS_FD_FOR_SELECT | PHP_STREAM_CAST_INTERNAL,
+		(void *)&fd, 0);
+	return fd;
+}
+
+/* Reactor C callback: drain available replies (non-blocking) and resolve the
+ * matching waiters' futures in FIFO order. Runs between coroutines. */
+static void redis_mux_pump(zend_async_event_t *event, zend_async_event_callback_t *callback,
+	void *result, zend_object *exception)
+{
+	redis_mux_t *lane = *(redis_mux_t **)((char *)event + event->extra_offset);
+	const php_socket_t fd = redis_mux_fd(lane->sock);
+	char tmp[16384];
+
+	for (;;) {
+		const ssize_t n = recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+		if (n > 0) {
+			smart_string_appendl(&lane->in_buf, tmp, (size_t)n);
+			if ((size_t)n < sizeof(tmp)) {
+				break;
+			}
+			continue;
+		}
+		break;
+	}
+
+	size_t off = 0;
+	while (lane->head != NULL) {
+		const size_t flen = redis_resp_frame_len(lane->in_buf.c + off, lane->in_buf.len - off);
+		if (flen == 0) {
+			break;
+		}
+
+		redis_mux_waiter_t *w = lane->head;
+		lane->head = w->next;
+		if (lane->head == NULL) {
+			lane->tail = NULL;
+		}
+		lane->in_flight--;
+
+		zval frame;
+		ZVAL_STR(&frame, zend_string_init(lane->in_buf.c + off, flen, 0));
+		ZEND_FUTURE_COMPLETE(w->future, &frame);
+		zval_ptr_dtor(&frame);
+		efree(w);
+
+		off += flen;
+	}
+
+	if (off > 0) {
+		if (off < lane->in_buf.len) {
+			memmove(lane->in_buf.c, lane->in_buf.c + off, lane->in_buf.len - off);
+		}
+		lane->in_buf.len -= off;
+	}
+
+	if (lane->in_flight == 0 && lane->read_ev != NULL) {
+		lane->read_ev->base.stop(&lane->read_ev->base);
+	}
+}
+
+/* Lazily open lane `idx`: a fresh connection (replaying the ctor options) plus a
+ * READABLE poll event wired to the pump. Returns NULL on failure. */
+static redis_mux_t *redis_mux_lane_get(redis_async_pool *rp, uint32_t idx)
+{
+	if (rp->lanes[idx] != NULL) {
+		return rp->lanes[idx];
+	}
+
+	RedisSock *sock = redis_sock_create(ZEND_STRL("127.0.0.1"), 6379, 0, 0, 0, NULL, 0);
+	if (sock == NULL) {
+		return NULL;
+	}
+
+	if (rp->opts != NULL && redis_sock_configure(sock, rp->opts) != SUCCESS) {
+		redis_pool_free_conn(sock);
+		return NULL;
+	}
+
+	sock->persistent = 0;
+
+	if (redis_sock_server_open(sock) != SUCCESS) {
+		redis_pool_free_conn(sock);
+		return NULL;
+	}
+
+	redis_mux_t *lane = ecalloc(1, sizeof(*lane));
+	lane->pool = rp;
+	lane->sock = sock;
+
+	const php_socket_t fd = redis_mux_fd(sock);
+	zend_async_poll_event_t *ev =
+		ZEND_ASYNC_NEW_SOCKET_EVENT_EX(fd, ASYNC_READABLE, sizeof(redis_mux_t *));
+	if (ev == NULL) {
+		redis_mux_lane_free(lane);
+		return NULL;
+	}
+
+	*(redis_mux_t **)((char *)&ev->base + ev->base.extra_offset) = lane;
+	ev->base.add_callback(&ev->base, ZEND_ASYNC_EVENT_CALLBACK(redis_mux_pump));
+	lane->read_ev = ev;
+
+	rp->lanes[idx] = lane;
+	return lane;
+}
+
+/* Pick the lane with the fewest in-flight replies (lazy-opening it). */
+static redis_mux_t *redis_mux_pick(redis_async_pool *rp)
+{
+	uint32_t best = 0;
+	for (uint32_t i = 1; i < rp->lane_count; i++) {
+		redis_mux_t *l = rp->lanes[i];
+		if (l == NULL || (rp->lanes[best] != NULL && l->in_flight < rp->lanes[best]->in_flight)) {
+			best = i;
+		}
+	}
+
+	return redis_mux_lane_get(rp, best);
+}
+
+/* Flush the lane's out_buf to the socket. Holds a write baton so concurrent
+ * senders only append; the holder drains everything (blocking writes park under
+ * backpressure — other coroutines keep appending to a fresh buffer). */
+static void redis_mux_flush(redis_mux_t *lane)
+{
+	if (lane->writing) {
+		return;
+	}
+
+	lane->writing = true;
+	while (lane->out_buf.len > 0) {
+		smart_string snd = lane->out_buf;
+		memset(&lane->out_buf, 0, sizeof(lane->out_buf));
+
+		php_stream_write(lane->sock->stream, snd.c, snd.len);
+		smart_string_free(&snd);
+	}
+	lane->writing = false;
+}
+
+/* Suspend the current coroutine until `future` is resolved (by the pump). */
+static void redis_mux_await(zend_future_t *future)
+{
+	ZEND_FUTURE_SET_USED(future);
+	ZEND_FUTURE_SET_EXCEPTION_CAUGHT(future);
+
+	zend_coroutine_event_callback_t *cb = ecalloc(1, sizeof(*cb));
+	cb->base.callback = zend_async_waker_callback_resolve;
+	cb->base.ref_count = 1;
+	cb->coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+	cb->event = &future->event;
+
+	zend_async_resume_when(ZEND_ASYNC_CURRENT_COROUTINE, &future->event, false,
+		zend_async_waker_callback_resolve, cb);
+
+	ZEND_ASYNC_SUSPEND();
+
+	ZEND_ASYNC_EVENT_CALLBACK_RELEASE(&cb->base);
+}
+
+/* Materialize a framed reply into return_value by feeding it to the ordinary
+ * (atomic) phpredis parser through a read-only memory stream. */
+static void redis_mux_materialize(redis_mux_t *lane, zend_string *frame,
+	FailableResultCallback resp_cb, void *ctx, INTERNAL_FUNCTION_PARAMETERS)
+{
+	php_stream *real = lane->sock->stream;
+	php_stream *mem = php_stream_memory_open(TEMP_STREAM_READONLY, frame);
+
+	lane->sock->stream = mem;
+	resp_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, lane->sock, NULL, ctx);
+	lane->sock->stream = real;
+
+	php_stream_close(mem);
+}
+
+bool redis_pool_should_mux(redis_object *redis)
+{
+	redis_async_pool *rp = redis->pool;
+	if (rp == NULL || rp->lane_count == 0) {
+		return false;
+	}
+
+	zend_coroutine_t *coro = ZEND_ASYNC_CURRENT_COROUTINE;
+	if (coro == NULL) {
+		return false;   /* mux needs a coroutine to suspend on the reply */
+	}
+
+	/* Skip mux while the coroutine holds a pinned checkout connection
+	 * (mid MULTI/WATCH/SUBSCRIBE) — that sequence stays on its private conn. */
+	redis_pool_binding_t *binding =
+		zend_hash_index_find_ptr(rp->bindings, redis_pool_coro_key(coro));
+	return binding == NULL || binding->conn == NULL;
+}
+
+void redis_mux_dispatch(redis_object *redis, char *cmd, int cmd_len,
+	FailableResultCallback resp_cb, void *ctx, INTERNAL_FUNCTION_PARAMETERS)
+{
+	redis_async_pool *rp = redis->pool;
+	redis_mux_t *lane = redis_mux_pick(rp);
+	if (UNEXPECTED(lane == NULL)) {
+		REDIS_THROW_EXCEPTION("Redis pool: failed to open multiplex lane", 0);
+		efree(cmd);
+		RETURN_FALSE;
+	}
+
+	zend_future_t *future = ZEND_ASYNC_NEW_FUTURE(false);
+
+	redis_mux_waiter_t *w = ecalloc(1, sizeof(*w));
+	w->future = future;
+	w->next = NULL;
+	if (lane->tail != NULL) {
+		lane->tail->next = w;
+	} else {
+		lane->head = w;
+	}
+	lane->tail = w;
+	lane->in_flight++;
+
+	smart_string_appendl(&lane->out_buf, cmd, cmd_len);
+	efree(cmd);
+	redis_mux_flush(lane);
+
+	lane->read_ev->base.start(&lane->read_ev->base);
+
+	redis_mux_await(future);
+
+	if (future->exception != NULL) {
+		ZEND_ASYNC_EVENT_RELEASE(&future->event);
+		RETURN_FALSE;
+	}
+
+	redis_mux_materialize(lane, Z_STR(future->result), resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	zval_ptr_dtor(&future->result);
+	ZVAL_UNDEF(&future->result);
+	ZEND_ASYNC_EVENT_RELEASE(&future->event);
 }
 
 /*

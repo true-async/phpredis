@@ -710,6 +710,36 @@ redis_process_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_cmd_cb cmd_cb,
     int cmd_len;
     char *cmd;
 
+    if (Z_TYPE_P(getThis()) == IS_OBJECT) {
+        redis_object *obj = PHPREDIS_ZVAL_GET_OBJECT(redis_object, getThis());
+        if (redis_pool_should_mux(obj)) {
+            if (UNEXPECTED(cmd_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, obj->sock, &cmd,
+                           &cmd_len, NULL, &ctx) == FAILURE)) {
+                RETURN_FALSE;
+            }
+            if (redis_cmd_is_multiplexable(cmd, cmd_len)) {
+                redis_mux_dispatch(obj, cmd, cmd_len, resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU);
+                return;
+            }
+            /* Stateful command: run it on a private checkout connection. */
+            redis_sock = redis_sock_get(getThis(), 0);
+            if (UNEXPECTED(redis_sock == NULL)) {
+                efree(cmd);
+                RETURN_FALSE;
+            }
+            if (redis_process_request(redis_sock, cmd, cmd_len) != SUCCESS) {
+                RETURN_FALSE;
+            }
+            if (IS_ATOMIC(redis_sock)) {
+                resp_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, redis_sock, NULL, ctx);
+            } else {
+                REDIS_PROCESS_RESPONSE_CLOSURE(resp_cb, ctx);
+            }
+            redis_pool_maybe_release(getThis());
+            return;
+        }
+    }
+
     redis_sock = redis_sock_get(getThis(), 0);
     if (UNEXPECTED(redis_sock == NULL)) {
         RETURN_FALSE;
@@ -746,6 +776,35 @@ redis_process_kw_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *kw,
     RedisSock *redis_sock;
     int cmd_len;
     char *cmd;
+
+    if (Z_TYPE_P(getThis()) == IS_OBJECT) {
+        redis_object *obj = PHPREDIS_ZVAL_GET_OBJECT(redis_object, getThis());
+        if (redis_pool_should_mux(obj)) {
+            if (UNEXPECTED(cmd_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, obj->sock, (char*)kw, &cmd,
+                           &cmd_len, NULL, &ctx) == FAILURE)) {
+                RETURN_FALSE;
+            }
+            if (redis_cmd_is_multiplexable(cmd, cmd_len)) {
+                redis_mux_dispatch(obj, cmd, cmd_len, resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU);
+                return;
+            }
+            redis_sock = redis_sock_get(getThis(), 0);
+            if (UNEXPECTED(redis_sock == NULL)) {
+                efree(cmd);
+                RETURN_FALSE;
+            }
+            if (redis_process_request(redis_sock, cmd, cmd_len) != SUCCESS) {
+                RETURN_FALSE;
+            }
+            if (IS_ATOMIC(redis_sock)) {
+                resp_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, redis_sock, NULL, ctx);
+            } else {
+                REDIS_PROCESS_RESPONSE_CLOSURE(resp_cb, ctx);
+            }
+            redis_pool_maybe_release(getThis());
+            return;
+        }
+    }
 
     redis_sock = redis_sock_get(getThis(), 0);
     if (UNEXPECTED(redis_sock == NULL)) {
