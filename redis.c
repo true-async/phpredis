@@ -701,6 +701,37 @@ static int redis_process_request(RedisSock *redis_sock, char *cmd, int cmdlen) {
     return res;
 }
 
+/* Run an already-built command on the pool fast paths: multiplex when eligible,
+ * else a private checkout connection. Takes ownership of `cmd`. */
+static void
+redis_pool_run_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_object *obj,
+                   char *cmd, int cmd_len, FailableResultCallback resp_cb, void *ctx)
+{
+    if (redis_cmd_is_multiplexable(cmd, cmd_len)) {
+        redis_mux_dispatch(obj, cmd, cmd_len, resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU);
+        return;
+    }
+
+    /* Stateful command: run it on a private checkout connection. */
+    RedisSock *redis_sock = redis_sock_get(getThis(), 0);
+    if (UNEXPECTED(redis_sock == NULL)) {
+        efree(cmd);
+        RETURN_FALSE;
+    }
+
+    if (redis_process_request(redis_sock, cmd, cmd_len) != SUCCESS) {
+        RETURN_FALSE;
+    }
+
+    if (IS_ATOMIC(redis_sock)) {
+        resp_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, redis_sock, NULL, ctx);
+    } else {
+        REDIS_PROCESS_RESPONSE_CLOSURE(resp_cb, ctx);
+    }
+
+    redis_pool_maybe_release(getThis());
+}
+
 static void
 redis_process_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_cmd_cb cmd_cb,
                   FailableResultCallback resp_cb)
@@ -717,25 +748,7 @@ redis_process_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_cmd_cb cmd_cb,
                            &cmd_len, NULL, &ctx) == FAILURE)) {
                 RETURN_FALSE;
             }
-            if (redis_cmd_is_multiplexable(cmd, cmd_len)) {
-                redis_mux_dispatch(obj, cmd, cmd_len, resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU);
-                return;
-            }
-            /* Stateful command: run it on a private checkout connection. */
-            redis_sock = redis_sock_get(getThis(), 0);
-            if (UNEXPECTED(redis_sock == NULL)) {
-                efree(cmd);
-                RETURN_FALSE;
-            }
-            if (redis_process_request(redis_sock, cmd, cmd_len) != SUCCESS) {
-                RETURN_FALSE;
-            }
-            if (IS_ATOMIC(redis_sock)) {
-                resp_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, redis_sock, NULL, ctx);
-            } else {
-                REDIS_PROCESS_RESPONSE_CLOSURE(resp_cb, ctx);
-            }
-            redis_pool_maybe_release(getThis());
+            redis_pool_run_cmd(INTERNAL_FUNCTION_PARAM_PASSTHRU, obj, cmd, cmd_len, resp_cb, ctx);
             return;
         }
     }
@@ -784,24 +797,7 @@ redis_process_kw_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *kw,
                            &cmd_len, NULL, &ctx) == FAILURE)) {
                 RETURN_FALSE;
             }
-            if (redis_cmd_is_multiplexable(cmd, cmd_len)) {
-                redis_mux_dispatch(obj, cmd, cmd_len, resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU);
-                return;
-            }
-            redis_sock = redis_sock_get(getThis(), 0);
-            if (UNEXPECTED(redis_sock == NULL)) {
-                efree(cmd);
-                RETURN_FALSE;
-            }
-            if (redis_process_request(redis_sock, cmd, cmd_len) != SUCCESS) {
-                RETURN_FALSE;
-            }
-            if (IS_ATOMIC(redis_sock)) {
-                resp_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, redis_sock, NULL, ctx);
-            } else {
-                REDIS_PROCESS_RESPONSE_CLOSURE(resp_cb, ctx);
-            }
-            redis_pool_maybe_release(getThis());
+            redis_pool_run_cmd(INTERNAL_FUNCTION_PARAM_PASSTHRU, obj, cmd, cmd_len, resp_cb, ctx);
             return;
         }
     }

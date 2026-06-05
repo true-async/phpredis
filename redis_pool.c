@@ -3,9 +3,12 @@
   See TRUE_ASYNC_POOL.md for the design and algorithm.
 
   The user-facing Redis object becomes a template: its own RedisSock is never
-  opened, physical connections live in a zend_async_pool_t. Each coroutine
-  checks out a connection for the duration of a command burst (or a pinned
-  stateful sequence) and returns it to the pool afterwards.
+  opened. Physical connections live in a zend_async_pool_t. Two paths share
+  them:
+    - checkout: a coroutine borrows a private connection for a command burst or
+      a pinned stateful sequence (MULTI/WATCH/SUBSCRIBE/SELECT) and returns it;
+    - multiplex: stateless commands ride shared lanes (one socket, many
+      coroutines) via an in-order reply pump. See the redis_mux_* section.
 */
 
 #include "php_redis.h"
@@ -47,25 +50,29 @@ typedef struct {
  * so reply order (the Redis wire guarantee) maps to waiter order.
  */
 typedef struct _redis_mux_waiter {
-	zend_future_t            *future;   /* awaitable; resolved with the framed reply */
+	zend_future_t            *future;   /* awaitable (holds a ref); resolved with the framed reply */
 	struct _redis_mux_waiter *next;
+	bool                      abandoned;/* sender gone (cancelled): pump discards the reply */
+	bool                      lane_failed;/* lane connection dropped: sender wakes and throws */
 } redis_mux_waiter_t;
 
 /*
  * One multiplex lane: a shared physical connection carrying many coroutines'
- * stateless commands with an in-order pending-reply FIFO. Created lazily on
- * first use.
+ * stateless commands with an in-order pending-reply FIFO. Opened eagerly at pool
+ * construction; sock == NULL marks a lane whose connection has dropped (dead).
  */
 typedef struct _redis_mux {
 	redis_async_pool *pool;             /* owning pool (lane context for the pump) */
 	RedisSock        *sock;             /* shared physical connection */
+	php_socket_t      fd;               /* cached socket fd (for non-blocking recv) */
 	redis_mux_waiter_t *head, *tail;    /* in-flight FIFO; order == reply order */
 	uint32_t          in_flight;        /* queue depth: lane selection + backpressure */
-	zend_async_poll_event_t *read_ev;   /* READABLE; armed while in_flight > 0 */
-	zend_async_poll_event_t *write_ev;  /* WRITABLE; armed only while out_buf has bytes */
+	zend_async_poll_event_t *poll_ev;   /* one combined watch: READABLE while in-flight,
+	                                       WRITABLE while out_buf has unsent bytes. A single
+	                                       handle per fd (two would conflict in libuv). */
+	async_poll_event  armed;            /* mask currently armed on poll_ev */
 	smart_string      out_buf;          /* pending outbound bytes (batched) */
 	smart_string      in_buf;           /* inbound bytes awaiting framing */
-	bool              writing;          /* a coroutine is flushing out_buf (write baton) */
 } redis_mux_t;
 
 struct _redis_async_pool {
@@ -75,7 +82,7 @@ struct _redis_async_pool {
 	zend_object       *wrapper;         /* cached getPool() wrapper, released on destroy */
 	long               db_default;      /* configured DB; drift pins the conn */
 	uint32_t           mux_reserve;     /* connections reserved for multiplexing */
-	redis_mux_t      **lanes;           /* mux lanes (NULL slot = not yet created) */
+	redis_mux_t      **lanes;           /* mux lanes (opened at construction) */
 	uint32_t           lane_count;      /* number of lanes (== configured mux) */
 };
 
@@ -88,6 +95,17 @@ static zend_always_inline zend_ulong redis_pool_coro_key(zend_coroutine_t *coro)
 	}
 
 	return ((uintptr_t)coro) >> ZEND_MM_ALIGNMENT_LOG2;
+}
+
+/* Binding for the current coroutine, or NULL if none (or no pool bindings). */
+static redis_pool_binding_t *redis_pool_current_binding(const redis_async_pool *rp)
+{
+	if (rp->bindings == NULL) {
+		return NULL;
+	}
+
+	zend_coroutine_t *coro = ZEND_ASYNC_CURRENT_COROUTINE;
+	return zend_hash_index_find_ptr(rp->bindings, coro ? redis_pool_coro_key(coro) : 0);
 }
 
 /* True if the connection currently carries pub/sub subscriptions. */
@@ -104,7 +122,7 @@ static bool redis_pool_sock_subscribed(const RedisSock *sock)
 
 /* A connection must stay pinned to its coroutine while stateful: mid
  * MULTI/PIPELINE, WATCH active, subscribed, or moved off the default DB. */
-static bool redis_conn_is_pinned(const redis_async_pool *rp, RedisSock *sock)
+static bool redis_conn_is_pinned(const redis_async_pool *rp, const RedisSock *sock)
 {
 	return !IS_ATOMIC(sock)
 		|| sock->watching
@@ -311,26 +329,54 @@ static void redis_pool_free_conn(RedisSock *sock)
 	redis_free_socket(sock);
 }
 
-/* Tear down a multiplex lane: stop poll events, drop the connection, free
- * buffers. The in-flight FIFO is expected to be empty by this point (the
- * command flow fails pending waiters before teardown). */
+/* Build a fresh, opened connection by replaying the constructor options.
+ * Returns a READY RedisSock, or NULL on failure. The pool owns its lifetime, so
+ * persistence is forced off. Shared by the checkout factory and the mux lanes. */
+static RedisSock *redis_pool_connect(const redis_async_pool *rp)
+{
+	RedisSock *sock = redis_sock_create(ZEND_STRL("127.0.0.1"), 6379, 0, 0, 0, NULL, 0);
+	if (sock == NULL) {
+		return NULL;
+	}
+
+	if (rp->opts != NULL && redis_sock_configure(sock, rp->opts) != SUCCESS) {
+		redis_pool_free_conn(sock);
+		return NULL;
+	}
+
+	sock->persistent = 0;
+
+	if (redis_sock_server_open(sock) != SUCCESS) {
+		redis_pool_free_conn(sock);
+		return NULL;
+	}
+
+	return sock;
+}
+
+/* Tear down a multiplex lane: stop poll events, drain any leftover waiters,
+ * drop the connection, free buffers. */
 static void redis_mux_lane_free(redis_mux_t *lane)
 {
 	if (lane == NULL) {
 		return;
 	}
 
-	/* TODO(mux teardown leak): a lane's READABLE poll event keeps the reactor
-	 * loop alive at process shutdown (uv_close is deferred and not drained when
-	 * lanes are freed during object teardown). One-time, non-growing; see §9a. */
-	if (lane->read_ev != NULL) {
-		lane->read_ev->base.stop(&lane->read_ev->base);
-		lane->read_ev->base.dispose(&lane->read_ev->base);
+	if (lane->poll_ev != NULL) {
+		if (lane->armed != 0) {
+			lane->poll_ev->base.stop(&lane->poll_ev->base);
+		}
+		lane->poll_ev->base.dispose(&lane->poll_ev->base);
 	}
 
-	if (lane->write_ev != NULL) {
-		lane->write_ev->base.stop(&lane->write_ev->base);
-		lane->write_ev->base.dispose(&lane->write_ev->base);
+	/* Drain any leftover waiters (e.g. abandoned ones whose reply never arrived)
+	 * so their futures are released and nodes freed. */
+	redis_mux_waiter_t *w = lane->head;
+	while (w != NULL) {
+		redis_mux_waiter_t *next = w->next;
+		ZEND_ASYNC_EVENT_RELEASE(&w->future->event);
+		efree(w);
+		w = next;
 	}
 
 	smart_string_free(&lane->out_buf);
@@ -340,7 +386,7 @@ static void redis_mux_lane_free(redis_mux_t *lane)
 }
 
 /*
- * Multiplex command path (v0: single lane, plain TCP).
+ * Multiplex command path (v0: N lanes, plain TCP — see TRUE_ASYNC_POOL.md §9b).
  */
 
 /* Underlying socket fd of a lane (for non-blocking recv in the pump). */
@@ -357,23 +403,97 @@ static php_socket_t redis_mux_fd(RedisSock *sock)
 	return fd;
 }
 
-/* Reactor C callback: drain available replies (non-blocking) and resolve the
- * matching waiters' futures in FIFO order. Runs between coroutines. */
-static void redis_mux_pump(zend_async_event_t *event, zend_async_event_callback_t *callback,
-	void *result, zend_object *exception)
+/* Re-arm the lane's single poll handle to what it currently needs: READABLE
+ * while replies are pending, WRITABLE while bytes await sending. One handle per
+ * fd — two (a separate read and write watch) would conflict in libuv. */
+static void redis_mux_update_poll(redis_mux_t *lane)
 {
-	redis_mux_t *lane = *(redis_mux_t **)((char *)event + event->extra_offset);
-	const php_socket_t fd = redis_mux_fd(lane->sock);
+	async_poll_event want = 0;
+	if (lane->in_flight > 0) {
+		want |= ASYNC_READABLE;
+	}
+	if (lane->out_buf.len > 0) {
+		want |= ASYNC_WRITABLE;
+	}
+
+	if (want == lane->armed) {
+		return;
+	}
+
+	if (lane->armed != 0) {
+		lane->poll_ev->base.stop(&lane->poll_ev->base);
+	}
+	if (want != 0) {
+		lane->poll_ev->events = want;
+		lane->poll_ev->base.start(&lane->poll_ev->base);
+	}
+	lane->armed = want;
+}
+
+/* Send as much of out_buf as the socket accepts right now (non-blocking, never
+ * parks). Any leftover stays buffered for the WRITABLE drain. */
+static void redis_mux_flush(redis_mux_t *lane)
+{
+	while (lane->out_buf.len > 0) {
+		const ssize_t n = send(lane->fd, lane->out_buf.c, lane->out_buf.len, MSG_DONTWAIT);
+		if (n <= 0) {
+			break;   /* EAGAIN/error: retry when the socket is writable again */
+		}
+		if ((size_t)n < lane->out_buf.len) {
+			memmove(lane->out_buf.c, lane->out_buf.c + (size_t)n, lane->out_buf.len - (size_t)n);
+		}
+		lane->out_buf.len -= (size_t)n;
+	}
+}
+
+/* A lane's connection dropped (peer close or hard error). Recovery is out of
+ * scope for v0 (fail-fast): stop the poll, fail every still-pending sender so it
+ * wakes and throws (the waiters stay in the FIFO and are freed at pool destroy —
+ * the lane outlives them), and drop the dead connection. The lane struct itself
+ * is kept (sock == NULL marks it dead) until the pool is destroyed. */
+static void redis_mux_lane_kill(redis_mux_t *lane)
+{
+	if (lane->armed != 0) {
+		lane->poll_ev->base.stop(&lane->poll_ev->base);   /* safe inside its own callback */
+		lane->armed = 0;
+	}
+
+	for (redis_mux_waiter_t *w = lane->head; w != NULL; w = w->next) {
+		if (w->abandoned) {
+			continue;   /* sender already gone; freed at destroy */
+		}
+
+		zval nul;
+		ZVAL_NULL(&nul);
+		w->lane_failed = true;
+		ZEND_FUTURE_COMPLETE(w->future, &nul);   /* wake sender; it throws */
+	}
+
+	redis_pool_free_conn(lane->sock);
+	lane->sock = NULL;
+	lane->fd = -1;
+}
+
+/* Drain complete replies (non-blocking) and resolve waiters' futures FIFO.
+ * Returns false if the connection dropped (the lane was killed). */
+static bool redis_mux_drain(redis_mux_t *lane)
+{
 	char tmp[16384];
+	bool died = false;
 
 	for (;;) {
-		const ssize_t n = recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+		const ssize_t n = recv(lane->fd, tmp, sizeof(tmp), MSG_DONTWAIT);
 		if (n > 0) {
 			smart_string_appendl(&lane->in_buf, tmp, (size_t)n);
 			if ((size_t)n < sizeof(tmp)) {
 				break;
 			}
 			continue;
+		}
+		if (n == 0) {
+			died = true;   /* peer closed the connection */
+		} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			died = true;   /* hard error */
 		}
 		break;
 	}
@@ -392,10 +512,16 @@ static void redis_mux_pump(zend_async_event_t *event, zend_async_event_callback_
 		}
 		lane->in_flight--;
 
-		zval frame;
-		ZVAL_STR(&frame, zend_string_init(lane->in_buf.c + off, flen, 0));
-		ZEND_FUTURE_COMPLETE(w->future, &frame);
-		zval_ptr_dtor(&frame);
+		/* Deliver the reply unless the sender was cancelled; either way the
+		 * bytes are consumed in order so the stream stays in sync. */
+		if (!w->abandoned) {
+			zval frame;
+			ZVAL_STR(&frame, zend_string_init(lane->in_buf.c + off, flen, 0));
+			ZEND_FUTURE_COMPLETE(w->future, &frame);
+			zval_ptr_dtor(&frame);
+		}
+
+		ZEND_ASYNC_EVENT_RELEASE(&w->future->event);   /* the waiter's future ref */
 		efree(w);
 
 		off += flen;
@@ -408,108 +534,120 @@ static void redis_mux_pump(zend_async_event_t *event, zend_async_event_callback_
 		lane->in_buf.len -= off;
 	}
 
-	if (lane->in_flight == 0 && lane->read_ev != NULL) {
-		lane->read_ev->base.stop(&lane->read_ev->base);
+	if (died) {
+		redis_mux_lane_kill(lane);   /* fail the rest; lane is now dead */
+		return false;
 	}
+
+	return true;
 }
 
-/* Lazily open lane `idx`: a fresh connection (replaying the ctor options) plus a
- * READABLE poll event wired to the pump. Returns NULL on failure. */
-static redis_mux_t *redis_mux_lane_get(redis_async_pool *rp, uint32_t idx)
+/* Combined reactor I/O callback: send what we can, drain what arrived, then
+ * re-arm the poll for whatever is still outstanding. Runs between coroutines. */
+static void redis_mux_io(zend_async_event_t *event, zend_async_event_callback_t *callback,
+	void *result, zend_object *exception)
 {
-	if (rp->lanes[idx] != NULL) {
-		return rp->lanes[idx];
+	redis_mux_t *lane = *(redis_mux_t **)((char *)event + event->extra_offset);
+	const async_poll_event triggered = ((zend_async_poll_event_t *)event)->triggered_events;
+
+	if (triggered & ASYNC_WRITABLE) {
+		redis_mux_flush(lane);
+	}
+	if (triggered & ASYNC_READABLE) {
+		if (!redis_mux_drain(lane)) {
+			return;   /* lane died and was killed; do not re-arm */
+		}
 	}
 
-	RedisSock *sock = redis_sock_create(ZEND_STRL("127.0.0.1"), 6379, 0, 0, 0, NULL, 0);
+	redis_mux_update_poll(lane);
+}
+
+/* Open one multiplex lane: a fresh connection (replaying the ctor options) plus a
+ * combined poll event wired to the I/O callback (armed on demand). Called eagerly
+ * at pool construction — the only place a connect may block/suspend — so the
+ * command path never opens a lane (and never suspends to connect). Returns NULL
+ * on failure; the constructor then fails fast. */
+static redis_mux_t *redis_mux_lane_open(redis_async_pool *rp)
+{
+	RedisSock *sock = redis_pool_connect(rp);
 	if (sock == NULL) {
-		return NULL;
-	}
-
-	if (rp->opts != NULL && redis_sock_configure(sock, rp->opts) != SUCCESS) {
-		redis_pool_free_conn(sock);
-		return NULL;
-	}
-
-	sock->persistent = 0;
-
-	if (redis_sock_server_open(sock) != SUCCESS) {
-		redis_pool_free_conn(sock);
 		return NULL;
 	}
 
 	redis_mux_t *lane = ecalloc(1, sizeof(*lane));
 	lane->pool = rp;
 	lane->sock = sock;
+	lane->fd = redis_mux_fd(sock);
 
-	const php_socket_t fd = redis_mux_fd(sock);
 	zend_async_poll_event_t *ev =
-		ZEND_ASYNC_NEW_SOCKET_EVENT_EX(fd, ASYNC_READABLE, sizeof(redis_mux_t *));
+		ZEND_ASYNC_NEW_SOCKET_EVENT_EX(lane->fd, ASYNC_READABLE, sizeof(redis_mux_t *));
 	if (ev == NULL) {
 		redis_mux_lane_free(lane);
 		return NULL;
 	}
 
 	*(redis_mux_t **)((char *)&ev->base + ev->base.extra_offset) = lane;
-	ev->base.add_callback(&ev->base, ZEND_ASYNC_EVENT_CALLBACK(redis_mux_pump));
-	lane->read_ev = ev;
+	ev->base.add_callback(&ev->base, ZEND_ASYNC_EVENT_CALLBACK(redis_mux_io));
+	lane->poll_ev = ev;   /* armed lazily via redis_mux_update_poll */
 
-	rp->lanes[idx] = lane;
 	return lane;
 }
 
-/* Pick the lane with the fewest in-flight replies (lazy-opening it). */
+/* Pick the live lane with the fewest in-flight replies. Dead lanes (a dropped
+ * connection, sock == NULL) are skipped; NULL means every lane is dead. */
 static redis_mux_t *redis_mux_pick(redis_async_pool *rp)
 {
-	uint32_t best = 0;
-	for (uint32_t i = 1; i < rp->lane_count; i++) {
+	redis_mux_t *best = NULL;
+
+	for (uint32_t i = 0; i < rp->lane_count; i++) {
 		redis_mux_t *l = rp->lanes[i];
-		if (l == NULL || (rp->lanes[best] != NULL && l->in_flight < rp->lanes[best]->in_flight)) {
-			best = i;
+		if (l == NULL || l->sock == NULL) {
+			continue;
+		}
+		if (best == NULL || l->in_flight < best->in_flight) {
+			best = l;
 		}
 	}
 
-	return redis_mux_lane_get(rp, best);
+	return best;
 }
 
-/* Flush the lane's out_buf to the socket. Holds a write baton so concurrent
- * senders only append; the holder drains everything (blocking writes park under
- * backpressure — other coroutines keep appending to a fresh buffer). */
-static void redis_mux_flush(redis_mux_t *lane)
+static void redis_mux_materialize(redis_mux_t *lane, zend_string *frame,
+	FailableResultCallback resp_cb, void *ctx, INTERNAL_FUNCTION_PARAMETERS);
+
+/* Suspend the current coroutine until the pump resolves `future`, then
+ * materialize the reply. Ownership: the future is resolved (not freed) by the
+ * wake callback, which delivers the reply into the coroutine's waker
+ * (waker->result) — we read it there, not from future->result. resume_when
+ * borrows the future; waker_clean releases that borrow and the result. The
+ * future's own ref is owned by the waiter and released by the pump.
+ * Returns true on a delivered reply, false if it was not delivered — the sender
+ * was cancelled (see w->abandoned) or the lane died (see w->lane_failed). */
+static bool redis_mux_await(redis_mux_t *lane, zend_future_t *future,
+	FailableResultCallback resp_cb, void *ctx, INTERNAL_FUNCTION_PARAMETERS)
 {
-	if (lane->writing) {
-		return;
-	}
+	zend_coroutine_t *coro = ZEND_ASYNC_CURRENT_COROUTINE;
 
-	lane->writing = true;
-	while (lane->out_buf.len > 0) {
-		smart_string snd = lane->out_buf;
-		memset(&lane->out_buf, 0, sizeof(lane->out_buf));
-
-		php_stream_write(lane->sock->stream, snd.c, snd.len);
-		smart_string_free(&snd);
-	}
-	lane->writing = false;
-}
-
-/* Suspend the current coroutine until `future` is resolved (by the pump). */
-static void redis_mux_await(zend_future_t *future)
-{
 	ZEND_FUTURE_SET_USED(future);
 	ZEND_FUTURE_SET_EXCEPTION_CAUGHT(future);
 
-	zend_coroutine_event_callback_t *cb = ecalloc(1, sizeof(*cb));
-	cb->base.callback = zend_async_waker_callback_resolve;
-	cb->base.ref_count = 1;
-	cb->coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
-	cb->event = &future->event;
-
-	zend_async_resume_when(ZEND_ASYNC_CURRENT_COROUTINE, &future->event, false,
-		zend_async_waker_callback_resolve, cb);
+	ZEND_ASYNC_WAKER_NEW(coro);
+	zend_async_resume_when(coro, &future->event, false,
+		zend_async_waker_callback_resolve, NULL);
 
 	ZEND_ASYNC_SUSPEND();
 
-	ZEND_ASYNC_EVENT_CALLBACK_RELEASE(&cb->base);
+	const bool delivered = EG(exception) == NULL
+		&& coro->waker != NULL
+		&& Z_TYPE(coro->waker->result) == IS_STRING;
+
+	if (delivered) {
+		redis_mux_materialize(lane, Z_STR(coro->waker->result), resp_cb, ctx,
+			INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	}
+
+	zend_async_waker_clean(coro);
+	return delivered;
 }
 
 /* Materialize a framed reply into return_value by feeding it to the ordinary
@@ -529,20 +667,18 @@ static void redis_mux_materialize(redis_mux_t *lane, zend_string *frame,
 
 bool redis_pool_should_mux(redis_object *redis)
 {
-	redis_async_pool *rp = redis->pool;
+	const redis_async_pool *rp = redis->pool;
 	if (rp == NULL || rp->lane_count == 0) {
 		return false;
 	}
 
-	zend_coroutine_t *coro = ZEND_ASYNC_CURRENT_COROUTINE;
-	if (coro == NULL) {
+	if (ZEND_ASYNC_CURRENT_COROUTINE == NULL) {
 		return false;   /* mux needs a coroutine to suspend on the reply */
 	}
 
 	/* Skip mux while the coroutine holds a pinned checkout connection
 	 * (mid MULTI/WATCH/SUBSCRIBE) — that sequence stays on its private conn. */
-	redis_pool_binding_t *binding =
-		zend_hash_index_find_ptr(rp->bindings, redis_pool_coro_key(coro));
+	const redis_pool_binding_t *binding = redis_pool_current_binding(rp);
 	return binding == NULL || binding->conn == NULL;
 }
 
@@ -552,16 +688,22 @@ void redis_mux_dispatch(redis_object *redis, char *cmd, int cmd_len,
 	redis_async_pool *rp = redis->pool;
 	redis_mux_t *lane = redis_mux_pick(rp);
 	if (UNEXPECTED(lane == NULL)) {
-		REDIS_THROW_EXCEPTION("Redis pool: failed to open multiplex lane", 0);
+		REDIS_THROW_EXCEPTION("Redis pool: multiplex lane unavailable", 0);
 		efree(cmd);
 		RETURN_FALSE;
 	}
 
+	/* The future's single ref belongs to the waiter; the pump releases it after
+	 * delivering or discarding the reply (or pool destroy does, for a dead lane).
+	 * resume_when borrows it for the await. */
 	zend_future_t *future = ZEND_ASYNC_NEW_FUTURE(false);
 
 	redis_mux_waiter_t *w = ecalloc(1, sizeof(*w));
 	w->future = future;
-	w->next = NULL;
+
+	/* Queue the command and register the waiter in one synchronous step — no yield
+	 * between, so FIFO order == wire order. The sender does no socket I/O: it only
+	 * arms the poll; the reactor callback owns all send/recv. */
 	if (lane->tail != NULL) {
 		lane->tail->next = w;
 	} else {
@@ -572,21 +714,22 @@ void redis_mux_dispatch(redis_object *redis, char *cmd, int cmd_len,
 
 	smart_string_appendl(&lane->out_buf, cmd, cmd_len);
 	efree(cmd);
-	redis_mux_flush(lane);
+	redis_mux_update_poll(lane);   /* arm READABLE (reply pending) + WRITABLE (bytes to send) */
 
-	lane->read_ev->base.start(&lane->read_ev->base);
+	if (!redis_mux_await(lane, future, resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU)) {
+		if (w->lane_failed) {
+			/* The lane's connection dropped while we were parked (the pump resolved
+			 * the future and killed the lane). The waiter stays queued and is freed
+			 * at pool destroy; surface the failure. */
+			REDIS_THROW_EXCEPTION("Redis pool: multiplex lane connection lost", 0);
+			RETURN_FALSE;
+		}
 
-	redis_mux_await(future);
-
-	if (future->exception != NULL) {
-		ZEND_ASYNC_EVENT_RELEASE(&future->event);
-		RETURN_FALSE;
+		/* Sender cancelled before the reply arrived: the waiter is still queued.
+		 * Abandon it so the pump discards the reply (in order) and frees it.
+		 * EG(exception) (the cancellation) propagates. */
+		w->abandoned = true;
 	}
-
-	redis_mux_materialize(lane, Z_STR(future->result), resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU);
-	zval_ptr_dtor(&future->result);
-	ZVAL_UNDEF(&future->result);
-	ZEND_ASYNC_EVENT_RELEASE(&future->event);
 }
 
 /*
@@ -602,22 +745,8 @@ static bool redis_pool_factory(zend_async_pool_t *pool, zval *result)
 		return false;
 	}
 
-	RedisSock *sock = redis_sock_create(ZEND_STRL("127.0.0.1"), 6379, 0, 0, 0, NULL, 0);
+	RedisSock *sock = redis_pool_connect(rp);
 	if (UNEXPECTED(sock == NULL)) {
-		return false;
-	}
-
-	if (rp->opts != NULL && redis_sock_configure(sock, rp->opts) != SUCCESS) {
-		redis_pool_free_conn(sock);
-		return false;
-	}
-
-	/* The pool owns connection lifetime; never route through the persistent
-	 * connection registry. */
-	sock->persistent = 0;
-
-	if (redis_sock_server_open(sock) != SUCCESS) {
-		redis_pool_free_conn(sock);
 		return false;
 	}
 
@@ -662,26 +791,15 @@ static bool redis_pool_before_acquire(zend_async_pool_t *pool, zval *resource)
  * the force-release safety net (coroutine finalized mid-sequence). */
 static bool redis_pool_before_release(zend_async_pool_t *pool, zval *resource)
 {
-	redis_async_pool *rp = (redis_async_pool *)pool->user_data;
-	RedisSock  *sock = Z_PTR_P(resource);
+	const redis_async_pool *rp = (const redis_async_pool *)pool->user_data;
+	RedisSock *sock = Z_PTR_P(resource);
 
-	if (sock == NULL || sock->stream == NULL) {
+	if (sock == NULL || sock->stream == NULL || sock->status == REDIS_SOCK_STATUS_FAILED) {
 		return false;
 	}
 
-	if (sock->status == REDIS_SOCK_STATUS_FAILED) {
-		return false;
-	}
-
-	if (!IS_ATOMIC(sock) || sock->watching || redis_pool_sock_subscribed(sock)) {
-		return false;
-	}
-
-	if (rp != NULL && sock->dbNumber != rp->db_default) {
-		return false;
-	}
-
-	return true;
+	/* Recycle only clean connections; drop anything still stateful. */
+	return rp == NULL || !redis_conn_is_pinned(rp, sock);
 }
 
 /*
@@ -801,13 +919,27 @@ int redis_pool_create(redis_object *redis, HashTable *opts)
 	rp->opts = zend_array_dup(opts);
 	rp->db_default = redis->sock ? redis->sock->dbNumber : 0;
 	rp->mux_reserve = (uint32_t)mux;
+	redis->pool = rp;
 
+	/* Pre-open all multiplex lanes here, in the constructor — the one place a
+	 * connect may block/suspend. The command path then never opens (or waits on)
+	 * a lane. Fail fast: any failure tears down the whole pool. Recovery of a lane
+	 * that drops later is out of scope for v0 (see TRUE_ASYNC_POOL.md §9b). */
 	if (mux > 0) {
 		rp->lane_count = (uint32_t)mux;
 		rp->lanes = ecalloc(rp->lane_count, sizeof(redis_mux_t *));
+
+		for (uint32_t i = 0; i < rp->lane_count; i++) {
+			rp->lanes[i] = redis_mux_lane_open(rp);
+
+			if (UNEXPECTED(rp->lanes[i] == NULL)) {
+				redis_pool_destroy(redis);
+				REDIS_THROW_EXCEPTION("Redis pool: failed to open multiplex lane", 0);
+				return FAILURE;
+			}
+		}
 	}
 
-	redis->pool = rp;
 	return SUCCESS;
 }
 
@@ -934,14 +1066,11 @@ void redis_pool_maybe_release(zval *id)
 	redis_object *redis = PHPREDIS_ZVAL_GET_OBJECT(redis_object, id);
 	redis_async_pool *rp = redis->pool;
 
-	if (rp == NULL || rp->bindings == NULL) {
+	if (rp == NULL) {
 		return;
 	}
 
-	zend_coroutine_t *coro = ZEND_ASYNC_CURRENT_COROUTINE;
-	const zend_ulong coro_key = coro ? redis_pool_coro_key(coro) : 0;
-
-	redis_pool_binding_t *binding = zend_hash_index_find_ptr(rp->bindings, coro_key);
+	redis_pool_binding_t *binding = redis_pool_current_binding(rp);
 	if (binding == NULL || binding->conn == NULL) {
 		return;
 	}

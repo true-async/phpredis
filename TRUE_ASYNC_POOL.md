@@ -11,10 +11,12 @@ best of both worlds.
   concurrent-MULTI isolation pass under ASAN.
 - **Stage 2 (multiplexing): working (v0).** The mux command path is implemented
   and verified — concurrent commands over shared lanes return correct, correctly
-  ordered replies under interleaving, with no per-operation leaks (ASAN). v0
-  caveats: plain TCP only (no SSL on the lane), blocking write baton (no WRITABLE
-  drain/backpressure yet), a one-time reactor-loop teardown leak (§9a), and no
-  `.phpt` coverage yet. See §5.
+  ordered replies under interleaving, fully leak-clean under a debug build
+  (`report_memleaks`: N=3..64 concurrency, cancellation, mux+checkout coexist,
+  connect failure — all zero leaks) and covered by `.phpt` (101–107). A single
+  combined READABLE|WRITABLE poll handle per lane with non-blocking `send`/`recv`
+  drives the pump. v0 caveats: plain TCP only (no SSL on the lane) and no
+  mid-flight broken-lane recovery (§9b). See §5.
 
 ---
 
@@ -279,11 +281,11 @@ Per multiplexed lane (`redis_mux_t`):
   `resp_cb`/`ctx` (those stay on the suspended coroutine's own stack). The list
   order is the reply-match order; per-command `emalloc` (ring-buffer slot reuse
   is a deferred optimization).
-- `zend_async_poll_event_t *read_ev` — a READABLE poll event on the socket FD
-  (`ZEND_ASYNC_NEW_SOCKET_EVENT(fd, ASYNC_READABLE)`), armed while `in_flight > 0`,
-  stopped when the FIFO drains.
-- `zend_async_poll_event_t *write_ev` — a WRITABLE poll event, armed only while
-  `out_buf` holds unsent bytes (avoids a writable-busy-loop).
+- `zend_async_poll_event_t *poll_ev` — **one** combined poll handle on the socket
+  FD (`ZEND_ASYNC_NEW_SOCKET_EVENT_EX`), its mask re-armed on demand: READABLE
+  while `in_flight > 0`, WRITABLE while `out_buf` holds unsent bytes. A single
+  handle per fd is mandatory — two libuv poll handles on the same fd conflict
+  (the deadlock found in early testing under write backpressure).
 - `smart_string in_buf` — inbound bytes awaiting framing (partial RESP frames).
 - `smart_string out_buf` — pending outbound bytes (batched writes → pipelining).
 
@@ -378,11 +380,13 @@ The concrete end-to-end flow (implemented and working; see Status):
    lazily opening the socket (and its READABLE poll event → pump) on first use.
 3. **Register a waiter**: a `zend_future_t` plus a FIFO node pushed at the lane's
    tail; `in_flight++`. The FIFO order is the wire order.
-4. **Write** (`redis_mux_flush`): append the bytes to `out_buf`; the write-baton
-   holder flushes them. Concurrent senders just append → one batched write =
+4. **Write** (`redis_mux_flush`): append the bytes to `out_buf` and non-blocking
+   `send(MSG_DONTWAIT)` as much as the socket takes; any remainder stays buffered
+   for the WRITABLE drain. Concurrent senders just append → one batched write =
    implicit pipelining.
-5. **Arm READABLE**: start the lane poll event so the reactor invokes the pump
-   when replies arrive.
+5. **Arm the poll** (`redis_mux_update_poll`): set READABLE (reply pending) and
+   WRITABLE (if bytes are still unsent) on the one combined handle so the reactor
+   invokes the pump.
 6. **Await** (`redis_mux_await`): the coroutine suspends on its Future; control
    returns to the scheduler and other coroutines pile their commands onto the
    same lane.
@@ -405,6 +409,30 @@ coroutines A,B,C  →  GET on one lane
            replyB → FIFO.pop = B → wake B
            replyC → FIFO.pop = C → wake C
 ```
+
+### 5.7 Race-free lazy lane creation
+
+Opening a lane *suspends*: `redis_pool_connect` performs the connect (and AUTH/
+handshake) through the async stream, so the creating coroutine yields mid-open.
+A naive "check `lanes[idx]`, connect, then store" therefore races: every
+coroutine cold-starting at once sees the slot empty, each opens its own socket,
+and all but the last assignment are orphaned — leaking `2·(N-1)` lanes for `N`
+coroutines and blowing the "live connections == mux" invariant (a thundering
+herd of connects).
+
+The fix is to **reserve the slot synchronously before the suspending connect**
+(`redis_mux_lane_get`): allocate the lane struct and store `lanes[idx]` with no
+yield in between, *then* connect. Concurrent coroutines that pick the same idx
+get the still-connecting lane and batch their commands onto it; `redis_mux_flush`
+and `redis_mux_update_poll` are guarded (no socket / no poll event yet) so the
+batch simply queues. When the connector finishes, its own dispatch flushes the
+whole accumulated out-buffer and arms the poll — replies then drain FIFO as
+usual. Exactly `mux` connections are opened, regardless of `N`.
+
+If the connect fails, `redis_mux_lane_fail` detaches the slot (so a later
+dispatch rebuilds it) and wakes any batched senders with a "not delivered"
+result; each fails its command, and the last one to wake frees the dead lane
+(refcount == its in-flight count) — no leak, no use-after-free.
 
 ---
 
@@ -461,15 +489,19 @@ pool, released on destroy.
 - [x] RESP frame-boundary scanner (`redis_resp_frame_len`; RESP2/RESP3, nesting,
       attributes, partial-frame safe; unit-tested across 21 cases).
 - [x] `redis_mux_t` lane struct + waiter (a `zend_future_t`) + lane array on the
-      pool + lifecycle (lazy slots, teardown). ASAN-clean construct/destroy.
-- [x] Lazy lane open + `argmin(in_flight)` selection.
+      pool + lifecycle (lazy slots, teardown). Leak-clean construct/destroy.
+- [x] Race-free lazy lane open (reserve slot before the suspending connect, §5.7)
+      + `argmin(in_flight)` selection.
 - [x] Reply pump: recv + frame + FIFO pop + `ZEND_FUTURE_COMPLETE`.
 - [x] Coroutine-side materialization via memory-stream + atomic `resp_cb`.
 - [x] Dispatch in `redis_process_cmd`/`_kw_cmd`; degrade to checkout.
-- [~] Write path: v0 blocking write baton + batching (WRITABLE drain TODO, §9b).
+- [x] Write path: non-blocking `send(MSG_DONTWAIT)` + WRITABLE-drain on one
+      combined poll handle + out-buffer batching (implicit pipelining).
+- [x] Connect-failure teardown: fail batched waiters, free dead lane (§5.7).
+- [x] Tests `tests/async/` 101–107: basic, high-concurrency, interleaved
+      ordering, stateful fallback, checkout coexist, cancellation, large frames.
 - [ ] Backpressure: bounded FIFO + out-buffer high-water park the producer (§9b).
-- [ ] Lane teardown leak fix (§9b) + broken-lane recovery + TLS on lanes.
-- [ ] Tests: reply ordering under interleaving, fallback, broken socket, batching.
+- [ ] Mid-flight broken-lane recovery + TLS on lanes (§9b).
 
 ---
 
@@ -540,21 +572,12 @@ multiplex path ships or as profiling dictates:
 
 ### 9b. Technical debt — multiplex v0
 
-5. **Lane teardown leak (reactor loop).** A lane's READABLE poll event keeps the
-   libuv loop alive at process shutdown: lanes are freed during object teardown
-   (`free_redis_object` → `redis_pool_destroy`), past the reactor's final
-   close-drain, so the deferred `uv_close` never completes. One-time and
-   non-growing (constant 2 allocations regardless of command count); the
-   per-operation path is leak-clean. Checkout connections (php_stream-managed) do
-   not hit this — only the explicit `ZEND_ASYNC_NEW_SOCKET_EVENT` does. Fix needs
-   closing lanes within the reactor-active phase (a pool-close/shutdown hook).
-6. **Blocking write baton, no backpressure.** v0 flushes `out_buf` with blocking
-   `php_stream_write`; there is no WRITABLE-drain path nor an in-flight/out-buffer
-   high-water mark yet (§5.3/§5.5).
-7. **Plain TCP only.** The pump reads via raw `recv(MSG_DONTWAIT)`, bypassing the
+5. **Plain TCP only.** The pump reads via raw `recv(MSG_DONTWAIT)`, bypassing the
    stream filters — TLS on a mux lane is not supported in v0.
-8. **Single-lane teardown of pending waiters.** A broken lane must fail its
-   in-flight futures and fall back to checkout (§5.5) — not yet implemented.
+6. **Broken-lane recovery mid-flight.** A lane that drops *after* it is connected
+   (peer reset with replies still pending) is not yet recovered: only the
+   connect-time failure path fails its batched waiters (§5.7). A live-lane EOF
+   should fail the in-flight futures and fall back to checkout (§5.5).
 
 ---
 
