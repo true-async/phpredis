@@ -702,12 +702,13 @@ static int redis_process_request(RedisSock *redis_sock, char *cmd, int cmdlen) {
 }
 
 /* Run an already-built command on the pool fast paths: multiplex when eligible,
- * else a private checkout connection. Takes ownership of `cmd`. */
+ * else a private checkout connection. `name` is the command verb (kw or method
+ * token) used to classify; takes ownership of `cmd`. */
 static void
-redis_pool_run_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_object *obj,
+redis_pool_run_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_object *obj, const char *name,
                    char *cmd, int cmd_len, FailableResultCallback resp_cb, void *ctx)
 {
-    if (redis_cmd_is_multiplexable(cmd, cmd_len)) {
+    if (redis_cmd_is_multiplexable(name)) {
         redis_mux_dispatch(obj, cmd, cmd_len, resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU);
         return;
     }
@@ -733,7 +734,7 @@ redis_pool_run_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_object *obj,
 }
 
 static void
-redis_process_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_cmd_cb cmd_cb,
+redis_process_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *name, redis_cmd_cb cmd_cb,
                   FailableResultCallback resp_cb)
 {
     RedisSock *redis_sock;
@@ -748,7 +749,7 @@ redis_process_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_cmd_cb cmd_cb,
                            &cmd_len, NULL, &ctx) == FAILURE)) {
                 RETURN_FALSE;
             }
-            redis_pool_run_cmd(INTERNAL_FUNCTION_PARAM_PASSTHRU, obj, cmd, cmd_len, resp_cb, ctx);
+            redis_pool_run_cmd(INTERNAL_FUNCTION_PARAM_PASSTHRU, obj, name, cmd, cmd_len, resp_cb, ctx);
             return;
         }
     }
@@ -778,7 +779,7 @@ redis_process_cmd(INTERNAL_FUNCTION_PARAMETERS, redis_cmd_cb cmd_cb,
 }
 
 #define REDIS_PROCESS_CMD(cmdname, resp_func) \
-    redis_process_cmd(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
+    redis_process_cmd(INTERNAL_FUNCTION_PARAM_PASSTHRU, #cmdname, \
                       redis_##cmdname##_cmd, resp_func)
 
 void
@@ -797,7 +798,7 @@ redis_process_kw_cmd(INTERNAL_FUNCTION_PARAMETERS, const char *kw,
                            &cmd_len, NULL, &ctx) == FAILURE)) {
                 RETURN_FALSE;
             }
-            redis_pool_run_cmd(INTERNAL_FUNCTION_PARAM_PASSTHRU, obj, cmd, cmd_len, resp_cb, ctx);
+            redis_pool_run_cmd(INTERNAL_FUNCTION_PARAM_PASSTHRU, obj, kw, cmd, cmd_len, resp_cb, ctx);
             return;
         }
     }

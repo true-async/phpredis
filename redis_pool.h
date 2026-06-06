@@ -28,10 +28,10 @@ void redis_pool_destroy(redis_object *redis);
  * userland must GC_ADDREF it. */
 zend_object *redis_pool_get_wrapper(redis_object *redis);
 
-/* True when a built command (raw RESP bytes) may ride the shared multiplexed
- * socket; false for stateful/blocking/connection-rebinding commands that must
- * take a private checkout connection. */
-bool redis_cmd_is_multiplexable(const char *cmd, int cmd_len);
+/* True when a command (by its verb — the dispatch kw or method token) may ride
+ * the shared multiplexed socket; false for stateful/blocking/connection-rebinding
+ * commands that must take a private checkout connection. Case-insensitive. */
+bool redis_cmd_is_multiplexable(const char *name);
 
 /* Length of one complete RESP reply at buf[0..len), or 0 when more bytes are
  * needed. Used by the multiplex reply pump for frame boundaries. */

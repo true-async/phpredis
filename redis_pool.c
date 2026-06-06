@@ -130,52 +130,12 @@ static bool redis_conn_is_pinned(const redis_async_pool *rp, const RedisSock *so
 		|| sock->dbNumber != rp->db_default;
 }
 
-/* Extract the command name (first RESP bulk argument) from built command bytes.
- * The wire form is "*<argc>\r\n$<len>\r\n<NAME>\r\n...". Writes up to dst_sz-1
- * upper-cased bytes plus a NUL; returns the name length, or 0 when it cannot be
- * parsed (caller then treats the command as non-multiplexable). */
-static size_t redis_cmd_name(const char *cmd, int cmd_len, char *dst, size_t dst_sz)
-{
-	const char *p = cmd, *end = cmd + cmd_len;
-
-	if (p >= end || *p != '*') {
-		return 0;
-	}
-
-	while (p < end && *p != '\n') {
-		p++;
-	}
-
-	if (++p >= end || *p != '$') {
-		return 0;
-	}
-
-	p++;
-	long len = 0;
-	while (p < end && *p >= '0' && *p <= '9') {
-		len = len * 10 + (*p - '0');
-		p++;
-	}
-
-	if (len <= 0 || (size_t)len >= dst_sz || p + 2 + len > end
-		|| p[0] != '\r' || p[1] != '\n') {
-		return 0;
-	}
-
-	p += 2;
-	for (long i = 0; i < len; i++) {
-		const char c = p[i];
-		dst[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
-	}
-
-	dst[len] = '\0';
-	return (size_t)len;
-}
-
-/* True when a built command may ride the shared multiplexed socket. Commands
- * that open a stateful sequence, block, or rebind the connection are excluded
- * and must take a private checkout connection instead. */
-bool redis_cmd_is_multiplexable(const char *cmd, int cmd_len)
+/* True when a command may ride the shared multiplexed socket. Commands that open
+ * a stateful sequence, block, or rebind the connection are excluded and must take
+ * a private checkout connection instead. The name is the command verb known at
+ * dispatch (the kw, or the method token) — no need to re-parse it from the wire
+ * bytes; the comparison is case-insensitive (kw is upper, tokens are lower). */
+bool redis_cmd_is_multiplexable(const char *name)
 {
 	static const char *const blocklist[] = {
 		"MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
@@ -187,13 +147,12 @@ bool redis_cmd_is_multiplexable(const char *cmd, int cmd_len)
 		NULL
 	};
 
-	char name[24];
-	if (redis_cmd_name(cmd, cmd_len, name, sizeof(name)) == 0) {
+	if (name == NULL) {
 		return false;
 	}
 
 	for (size_t i = 0; blocklist[i] != NULL; i++) {
-		if (strcmp(name, blocklist[i]) == 0) {
+		if (strcasecmp(name, blocklist[i]) == 0) {
 			return false;
 		}
 	}

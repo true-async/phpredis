@@ -299,25 +299,28 @@ affinity is needed: in mux mode a coroutine has at most one command in flight
 ### 5.2 Dispatch (in the generic command dispatchers)
 
 The decision lives in `redis_process_cmd` / `redis_process_kw_cmd`, where the
-command is built, not in `redis_sock_get` (which runs before the command is
-known). The command kind is read from the built RESP bytes:
+command verb is already known — the `kw` for keyword dispatch, the method token
+for the rest. That verb is passed down to the classifier; nothing re-parses it
+out of the serialized RESP bytes:
 
 ```
-redis_process_cmd(obj, cmd_cb, resp_cb):
+redis_process_cmd(obj, name, cmd_cb, resp_cb):     # name == "GET"/"SELECT"/...
     if pool && mux_enabled && coro has no pinned conn:
         cmd_cb(template_sock, &cmd, &cmd_len)               # build the RESP frame
-        if redis_cmd_is_multiplexable(cmd, cmd_len):        # parse name from bytes
+        if redis_cmd_is_multiplexable(name):                # classify by verb
             return redis_mux_dispatch(pool, cmd, cmd_len, resp_cb, ctx)   # §5.3
         # not multiplexable -> checkout with the already-built cmd
         sock = redis_pool_acquire_conn(obj); write; read; return
     ... existing checkout/normal path ...
 ```
 
-`redis_cmd_is_multiplexable` parses the command name from the wire bytes
-(`*argc\r\n$len\r\nNAME\r\n…`) and rejects `MULTI/EXEC/DISCARD/WATCH/UNWATCH,
-SUBSCRIBE*/UNSUBSCRIBE*, BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/BZPOP*/BZMPOP,
-WAIT/WAITAOF, SELECT/SWAPDB, MONITOR, RESET`. A coroutine that already holds a
-pinned checkout connection (mid stateful sequence) keeps using it.
+`redis_cmd_is_multiplexable(name)` is a case-insensitive blocklist check
+(`kw` is upper, method tokens are lower) rejecting `MULTI/EXEC/DISCARD/WATCH/
+UNWATCH, SUBSCRIBE*/UNSUBSCRIBE*, BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/BZPOP*/
+BZMPOP, WAIT/WAITAOF, SELECT/SWAPDB, MONITOR, RESET`. The verb is the authoritative
+name (the `kw`/token the builder itself uses), so no wire re-parse and no NUL-edge.
+`rawCommand` never reaches here — it always takes a checkout connection. A
+coroutine that already holds a pinned checkout connection keeps using it.
 
 ### 5.3 Command flow (mux mode)
 
@@ -376,22 +379,22 @@ The concrete end-to-end flow (implemented and working; see Status):
    (`*2\r\n$3\r\nGET\r\n$1\r\nx\r\n`) using the template socket's serializer.
    Gate on `redis_pool_should_mux` (pool + mux, in a coroutine, no pinned conn)
    and `redis_cmd_is_multiplexable` (GET → yes).
-2. **Pick a lane** (`redis_mux_pick`): `argmin(in_flight)` across the lanes,
-   lazily opening the socket (and its READABLE poll event → pump) on first use.
+2. **Pick a lane** (`redis_mux_pick`): `argmin(in_flight)` across the live lanes
+   (already connected in the constructor; dead lanes skipped).
 3. **Register a waiter**: a `zend_future_t` plus a FIFO node pushed at the lane's
    tail; `in_flight++`. The FIFO order is the wire order.
-4. **Write** (`redis_mux_flush`): append the bytes to `out_buf` and non-blocking
-   `send(MSG_DONTWAIT)` as much as the socket takes; any remainder stays buffered
-   for the WRITABLE drain. Concurrent senders just append → one batched write =
+4. **Queue the bytes**: append the command to `out_buf` — the sender does no
+   socket I/O. Concurrent senders just append → one batched `send` later =
    implicit pipelining.
 5. **Arm the poll** (`redis_mux_update_poll`): set READABLE (reply pending) and
-   WRITABLE (if bytes are still unsent) on the one combined handle so the reactor
-   invokes the pump.
+   WRITABLE (bytes to send) on the one combined handle so the reactor invokes the
+   I/O callback. If the lane is already armed, this is a no-op.
 6. **Await** (`redis_mux_await`): the coroutine suspends on its Future; control
    returns to the scheduler and other coroutines pile their commands onto the
    same lane.
-7. **Reply pump** (`redis_mux_pump`, a reactor C callback firing on socket
-   readability, between coroutines): non-blocking `recv` into `in_buf`; for each
+7. **I/O callback** (`redis_mux_io`, a reactor C callback firing on socket
+   readability/writability, between coroutines): `redis_mux_flush` sends `out_buf`
+   non-blocking; `redis_mux_drain` does non-blocking `recv` into `in_buf`; for each
    complete RESP frame (`redis_resp_frame_len`) pop the FIFO head waiter (in
    order) and `ZEND_FUTURE_COMPLETE(future, frame)` → resolves the Future →
    resumes that coroutine.
@@ -410,29 +413,31 @@ coroutines A,B,C  →  GET on one lane
            replyC → FIFO.pop = C → wake C
 ```
 
-### 5.7 Race-free lazy lane creation
+### 5.7 Eager lanes — no connect in the command path
 
 Opening a lane *suspends*: `redis_pool_connect` performs the connect (and AUTH/
-handshake) through the async stream, so the creating coroutine yields mid-open.
-A naive "check `lanes[idx]`, connect, then store" therefore races: every
-coroutine cold-starting at once sees the slot empty, each opens its own socket,
-and all but the last assignment are orphaned — leaking `2·(N-1)` lanes for `N`
-coroutines and blowing the "live connections == mux" invariant (a thundering
-herd of connects).
+handshake) through the async stream. So lanes are **never** opened from a command
+coroutine — they are opened **eagerly in the constructor** (`redis_pool_create` →
+`redis_mux_lane_open`, `mux` of them), the one place where blocking/suspending to
+connect is acceptable. If any lane fails to connect, construction **fails fast**
+(throws and tears the pool down). This sidesteps a whole class of bug: a lazy
+"check slot, connect, store" opened inside the command coroutine raced — every
+coroutine cold-starting at once saw an empty slot, each opened its own socket, and
+all but the last leaked (`2·(N-1)` lanes), also defeating "live connections ==
+mux". Eager construction removes the race by construction.
 
-The fix is to **reserve the slot synchronously before the suspending connect**
-(`redis_mux_lane_get`): allocate the lane struct and store `lanes[idx]` with no
-yield in between, *then* connect. Concurrent coroutines that pick the same idx
-get the still-connecting lane and batch their commands onto it; `redis_mux_flush`
-and `redis_mux_update_poll` are guarded (no socket / no poll event yet) so the
-batch simply queues. When the connector finishes, its own dispatch flushes the
-whole accumulated out-buffer and arms the poll — replies then drain FIFO as
-usual. Exactly `mux` connections are opened, regardless of `N`.
+The command path therefore never connects and never suspends to connect. A sender
+does no socket I/O at all: it queues its command (`out_buf` + a waiter in the
+lane's FIFO) and arms the poll (`redis_mux_update_poll`); if the lane is already
+being serviced, the arm is a no-op and the sender just leaves the command in the
+queue. The reactor callback (`redis_mux_io`) owns every `send`/`recv`.
 
-If the connect fails, `redis_mux_lane_fail` detaches the slot (so a later
-dispatch rebuilds it) and wakes any batched senders with a "not delivered"
-result; each fails its command, and the last one to wake frees the dead lane
-(refcount == its in-flight count) — no leak, no use-after-free.
+A lane dropped mid-flight (`recv` returns 0 / hard error) is killed
+(`redis_mux_lane_kill`): the poll is stopped, every still-pending sender is woken
+to throw (waiters stay queued, freed at pool destroy), the socket is closed and
+`sock` set to `NULL` (the lane is now dead and skipped by `redis_mux_pick`).
+Recovery of a dropped lane is out of scope for v0 — failures surface as
+exceptions, never as a hang.
 
 ---
 
@@ -485,21 +490,23 @@ pool, released on destroy.
       transaction pin, MULTI isolation, getPool introspection) — all green.
 
 ### Stage 2 — multiplex queue
-- [x] `redis_cmd_is_multiplexable` classifier (command name parsed from RESP bytes).
+- [x] `redis_cmd_is_multiplexable(name)` classifier — by command verb known at
+      dispatch (kw / method token), case-insensitive blocklist; no wire re-parse.
 - [x] RESP frame-boundary scanner (`redis_resp_frame_len`; RESP2/RESP3, nesting,
       attributes, partial-frame safe; unit-tested across 21 cases).
 - [x] `redis_mux_t` lane struct + waiter (a `zend_future_t`) + lane array on the
-      pool + lifecycle (lazy slots, teardown). Leak-clean construct/destroy.
-- [x] Race-free lazy lane open (reserve slot before the suspending connect, §5.7)
-      + `argmin(in_flight)` selection.
+      pool + lifecycle. Leak-clean construct/destroy.
+- [x] Eager lane open in the constructor (fail-fast, §5.7) + `argmin(in_flight)`
+      selection; command path never connects.
 - [x] Reply pump: recv + frame + FIFO pop + `ZEND_FUTURE_COMPLETE`.
 - [x] Coroutine-side materialization via memory-stream + atomic `resp_cb`.
 - [x] Dispatch in `redis_process_cmd`/`_kw_cmd`; degrade to checkout.
 - [x] Write path: non-blocking `send(MSG_DONTWAIT)` + WRITABLE-drain on one
       combined poll handle + out-buffer batching (implicit pipelining).
-- [x] Connect-failure teardown: fail batched waiters, free dead lane (§5.7).
-- [x] Tests `tests/async/` 101–107: basic, high-concurrency, interleaved
-      ordering, stateful fallback, checkout coexist, cancellation, large frames.
+- [x] Lane-death kill: fail pending senders, drop the lane (no recovery, §5.7).
+- [x] Tests `tests/async/` 101–109: basic, high-concurrency, interleaved
+      ordering, stateful fallback, checkout coexist, cancellation, large frames,
+      construct fail-fast, command routing.
 - [ ] Backpressure: bounded FIFO + out-buffer high-water park the producer (§9b).
 - [ ] Mid-flight broken-lane recovery + TLS on lanes (§9b).
 
@@ -574,10 +581,10 @@ multiplex path ships or as profiling dictates:
 
 5. **Plain TCP only.** The pump reads via raw `recv(MSG_DONTWAIT)`, bypassing the
    stream filters — TLS on a mux lane is not supported in v0.
-6. **Broken-lane recovery mid-flight.** A lane that drops *after* it is connected
-   (peer reset with replies still pending) is not yet recovered: only the
-   connect-time failure path fails its batched waiters (§5.7). A live-lane EOF
-   should fail the in-flight futures and fall back to checkout (§5.5).
+6. **Broken-lane recovery mid-flight.** A dropped lane is killed and its pending
+   commands fail (§5.7) — correct, but not *recovered*: the lane stays dead until
+   the pool is destroyed. A future version should reconnect it (off the command
+   path) and fall back to checkout meanwhile (§5.5).
 
 ---
 
