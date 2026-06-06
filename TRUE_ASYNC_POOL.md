@@ -122,7 +122,8 @@ struct _redis_async_pool {
     HashTable         *opts;            /* dup'd ctor options; factory replays */
     zend_object       *wrapper;         /* cached getPool() wrapper, released on destroy */
     long               db_default;      /* configured DB; drift pins the conn */
-    uint32_t           mux_reserve;     /* connections reserved for multiplexing */
+    redis_mux_t      **lanes;           /* mux lanes, opened at construction */
+    uint32_t           lane_count;      /* number of lanes (== configured mux) */
 };
 ```
 
@@ -260,8 +261,8 @@ connection is dropped rather than recycled.
 
 ## 5. Algorithm — Stage 2 (multiplex queue)
 
-Enabled when `mux_reserve > 0`. Goal: stream many coroutines' stateless commands
-over 1–3 shared sockets with implicit pipelining.
+Enabled when `lane_count > 0` (the `mux` option). Goal: stream many coroutines'
+stateless commands over 1–3 shared sockets with implicit pipelining.
 
 **Key principle (corrected): no dedicated reader coroutine.** Replies are read
 **event-driven, in C callbacks running between coroutines**, driven by socket

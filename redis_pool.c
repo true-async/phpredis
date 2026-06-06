@@ -64,9 +64,9 @@ typedef struct _redis_mux_waiter {
 typedef struct _redis_mux {
 	redis_async_pool *pool;             /* owning pool (lane context for the pump) */
 	RedisSock        *sock;             /* shared physical connection */
-	php_socket_t      fd;               /* cached socket fd (for non-blocking recv) */
+	php_socket_t      fd;               /* cached socket fd (non-blocking send/recv) */
 	redis_mux_waiter_t *head, *tail;    /* in-flight FIFO; order == reply order */
-	uint32_t          in_flight;        /* queue depth: lane selection + backpressure */
+	uint32_t          in_flight;        /* pending replies; drives lane selection */
 	zend_async_poll_event_t *poll_ev;   /* one combined watch: READABLE while in-flight,
 	                                       WRITABLE while out_buf has unsent bytes. A single
 	                                       handle per fd (two would conflict in libuv). */
@@ -81,7 +81,6 @@ struct _redis_async_pool {
 	HashTable         *opts;            /* dup'd ctor options; factory re-applies */
 	zend_object       *wrapper;         /* cached getPool() wrapper, released on destroy */
 	long               db_default;      /* configured DB; drift pins the conn */
-	uint32_t           mux_reserve;     /* connections reserved for multiplexing */
 	redis_mux_t      **lanes;           /* mux lanes (opened at construction) */
 	uint32_t           lane_count;      /* number of lanes (== configured mux) */
 };
@@ -348,7 +347,7 @@ static void redis_mux_lane_free(redis_mux_t *lane)
  * Multiplex command path (v0: N lanes, plain TCP — see TRUE_ASYNC_POOL.md §9b).
  */
 
-/* Underlying socket fd of a lane (for non-blocking recv in the pump). */
+/* Underlying socket fd of a lane (for non-blocking send/recv in the pump). */
 static php_socket_t redis_mux_fd(RedisSock *sock)
 {
 	php_socket_t fd = -1;
@@ -571,8 +570,20 @@ static redis_mux_t *redis_mux_pick(redis_async_pool *rp)
 	return best;
 }
 
+/* Materialize a framed reply into return_value by feeding it to the ordinary
+ * (atomic) phpredis parser through a read-only memory stream. */
 static void redis_mux_materialize(redis_mux_t *lane, zend_string *frame,
-	FailableResultCallback resp_cb, void *ctx, INTERNAL_FUNCTION_PARAMETERS);
+	FailableResultCallback resp_cb, void *ctx, INTERNAL_FUNCTION_PARAMETERS)
+{
+	php_stream *real = lane->sock->stream;
+	php_stream *mem = php_stream_memory_open(TEMP_STREAM_READONLY, frame);
+
+	lane->sock->stream = mem;
+	resp_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, lane->sock, NULL, ctx);
+	lane->sock->stream = real;
+
+	php_stream_close(mem);
+}
 
 /* Suspend the current coroutine until the pump resolves `future`, then
  * materialize the reply. Ownership: the future is resolved (not freed) by the
@@ -607,21 +618,6 @@ static bool redis_mux_await(redis_mux_t *lane, zend_future_t *future,
 
 	zend_async_waker_clean(coro);
 	return delivered;
-}
-
-/* Materialize a framed reply into return_value by feeding it to the ordinary
- * (atomic) phpredis parser through a read-only memory stream. */
-static void redis_mux_materialize(redis_mux_t *lane, zend_string *frame,
-	FailableResultCallback resp_cb, void *ctx, INTERNAL_FUNCTION_PARAMETERS)
-{
-	php_stream *real = lane->sock->stream;
-	php_stream *mem = php_stream_memory_open(TEMP_STREAM_READONLY, frame);
-
-	lane->sock->stream = mem;
-	resp_cb(INTERNAL_FUNCTION_PARAM_PASSTHRU, lane->sock, NULL, ctx);
-	lane->sock->stream = real;
-
-	php_stream_close(mem);
 }
 
 bool redis_pool_should_mux(redis_object *redis)
@@ -673,7 +669,7 @@ void redis_mux_dispatch(redis_object *redis, char *cmd, int cmd_len,
 
 	smart_string_appendl(&lane->out_buf, cmd, cmd_len);
 	efree(cmd);
-	redis_mux_update_poll(lane);   /* arm READABLE (reply pending) + WRITABLE (bytes to send) */
+	redis_mux_update_poll(lane);
 
 	if (!redis_mux_await(lane, future, resp_cb, ctx, INTERNAL_FUNCTION_PARAM_PASSTHRU)) {
 		if (w->lane_failed) {
@@ -877,7 +873,6 @@ int redis_pool_create(redis_object *redis, HashTable *opts)
 
 	rp->opts = zend_array_dup(opts);
 	rp->db_default = redis->sock ? redis->sock->dbNumber : 0;
-	rp->mux_reserve = (uint32_t)mux;
 	redis->pool = rp;
 
 	/* Pre-open all multiplex lanes here, in the constructor — the one place a
