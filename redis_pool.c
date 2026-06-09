@@ -449,7 +449,7 @@ static bool redis_mux_drain(redis_mux_t *lane)
 		}
 		if (n == 0) {
 			died = true;   /* peer closed the connection */
-		} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+		} else if (!REDIS_WOULD_BLOCK()) {
 			died = true;   /* hard error */
 		}
 		break;
