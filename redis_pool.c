@@ -24,7 +24,6 @@
 #include "zend_exceptions.h"
 #include "php_streams.h"
 #include "php_network.h"
-#include "ext/standard/php_smart_string.h"
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
@@ -40,8 +39,8 @@ typedef struct {
 	zend_async_event_callback_t event;  /* must be first for the callback cast */
 	redis_async_pool *pool;             /* owning pool, NULL once destroyed */
 	RedisSock   *conn;                  /* checked-out conn, NULL if released */
-	zend_ulong   coro_key;              /* key in pool->bindings */
-	bool         has_coro_callback;     /* registered with the coroutine event */
+	zend_ulong   coro_key;             /* key in pool->bindings */
+	bool         has_coro_callback;    /* registered with the coroutine event */
 } redis_pool_binding_t;
 
 /*
