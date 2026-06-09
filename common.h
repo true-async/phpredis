@@ -93,6 +93,20 @@
 
 #include "backoff.h"
 
+/* Windows socket compatibility for the multiplexed pool (redis_pool.c).
+ * MSG_DONTWAIT is Linux-only; on Windows, non-blocking mode is set on the
+ * socket itself via ioctlsocket/FIONBIO (done by PHP/libuv), so flags=0 is
+ * equivalent. After a would-block recv/send, WSAGetLastError()==WSAEWOULDBLOCK
+ * rather than errno==EAGAIN, so REDIS_WOULD_BLOCK() abstracts both. */
+#ifdef PHP_WIN32
+# ifndef MSG_DONTWAIT
+#  define MSG_DONTWAIT 0
+# endif
+# define REDIS_WOULD_BLOCK() (WSAGetLastError() == WSAEWOULDBLOCK)
+#else
+# define REDIS_WOULD_BLOCK() (errno == EAGAIN || errno == EWOULDBLOCK)
+#endif
+
 typedef enum {
     REDIS_SOCK_STATUS_FAILED = -1,
     REDIS_SOCK_STATUS_DISCONNECTED,
