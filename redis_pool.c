@@ -77,6 +77,7 @@ typedef struct _redis_mux {
 
 struct _redis_async_pool {
 	zend_async_pool_t *async_pool;      /* physical RedisSock resources */
+	redis_object      *redis;           /* owner; its sock is the connection template */
 	HashTable         *bindings;        /* coro_key -> redis_pool_binding_t* */
 	HashTable         *opts;            /* dup'd ctor options; factory re-applies */
 	zend_object       *wrapper;         /* cached getPool() wrapper, released on destroy */
@@ -292,9 +293,39 @@ static void redis_pool_free_conn(RedisSock *sock)
  * persistence is forced off. Shared by the checkout factory and the mux lanes. */
 static RedisSock *redis_pool_connect(const redis_async_pool *rp)
 {
-	RedisSock *sock = redis_sock_create(ZEND_STRL("127.0.0.1"), 6379, 0, 0, 0, NULL, 0);
+	/* Seed the connection target from the owner's template socket, which carries
+	 * whatever the constructor options or a later connect() configured. The ctor
+	 * `opts` below still override. Without a template, fall back to the loopback
+	 * default. */
+	RedisSock *tmpl = rp->redis != NULL ? rp->redis->sock : NULL;
+
+	const char *host  = "127.0.0.1";
+	size_t host_len   = sizeof("127.0.0.1") - 1;
+	int port          = 6379;
+	double timeout    = 0, read_timeout = 0;
+
+	if (tmpl != NULL) {
+		if (tmpl->host != NULL) {
+			host = ZSTR_VAL(tmpl->host);
+			host_len = ZSTR_LEN(tmpl->host);
+		}
+
+		port = tmpl->port;
+		timeout = tmpl->timeout;
+		read_timeout = tmpl->read_timeout;
+	}
+
+	RedisSock *sock = redis_sock_create((char *)host, host_len, port, timeout, read_timeout, 0, NULL, 0);
 	if (sock == NULL) {
 		return NULL;
+	}
+
+	/* Carry over auth, selected DB, TLS context and keepalive from the template. */
+	if (tmpl != NULL) {
+		redis_sock_set_auth(sock, tmpl->user, tmpl->pass);
+		redis_sock_set_context(sock, tmpl->context);
+		sock->dbNumber = tmpl->dbNumber;
+		sock->tcp_keepalive = tmpl->tcp_keepalive;
 	}
 
 	if (rp->opts != NULL && redis_sock_configure(sock, rp->opts) != SUCCESS) {
@@ -871,6 +902,7 @@ int redis_pool_create(redis_object *redis, HashTable *opts)
 	rp->bindings = emalloc(sizeof(HashTable));
 	zend_hash_init(rp->bindings, 8, NULL, NULL, 0);
 
+	rp->redis = redis;
 	rp->opts = zend_array_dup(opts);
 	rp->db_default = redis->sock ? redis->sock->dbNumber : 0;
 	redis->pool = rp;
