@@ -629,6 +629,15 @@ redis_connect(INTERNAL_FUNCTION_PARAMETERS, int persistent)
 
     redis = PHPREDIS_ZVAL_GET_OBJECT(redis_object, object);
 
+    /* In pool mode the object is a template, not a single live connection.
+     * connect()/pconnect() has no meaning here and would silently diverge from
+     * the pool's own connections — reject it and require host/port in the
+     * constructor options instead. */
+    if (redis->pool != NULL) {
+        REDIS_THROW_EXCEPTION("Redis::connect() is not supported in pool mode; set 'host' and 'port' in the constructor options", 0);
+        return FAILURE;
+    }
+
     /* if there is a redis sock already we have to remove it */
     if (redis->sock) {
         redis_sock_disconnect(redis->sock, 0, 1);
