@@ -2569,6 +2569,11 @@ PHP_METHOD(Redis, setOption)
     }
 
     redis_setoption_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU, redis_sock, NULL);
+
+    /* In pool mode the option landed on the template socket only. */
+    if (Z_TYPE_P(return_value) == IS_TRUE) {
+        redis_pool_options_changed(PHPREDIS_ZVAL_GET_OBJECT(redis_object, getThis()));
+    }
 }
 /* }}} */
 

@@ -82,7 +82,78 @@ struct _redis_async_pool {
 	long               db_default;      /* configured DB; drift pins the conn */
 	redis_mux_t      **lanes;           /* mux lanes (opened at construction) */
 	uint32_t           lane_count;      /* number of lanes (== configured mux) */
+	RedisSock         *template_sock;   /* the object's own socket: source of setOption() state */
+	uint32_t           opt_gen;         /* bumped by setOption(); conns re-sync lazily */
 };
+
+/* Copy the setOption() state (serializer, compression, prefix, ...) from the
+ * template socket onto a pooled connection. */
+static void redis_pool_copy_opts(const RedisSock *tpl, RedisSock *dst)
+{
+	if (UNEXPECTED(tpl == NULL || tpl == dst)) {
+		return;
+	}
+
+	dst->serializer = tpl->serializer;
+	dst->pack_ignore_numbers = tpl->pack_ignore_numbers;
+	dst->compression = tpl->compression;
+	dst->compression_level = tpl->compression_level;
+	dst->reply_literal = tpl->reply_literal;
+	dst->null_mbulk_as_null = tpl->null_mbulk_as_null;
+	dst->scan = tpl->scan;
+	dst->max_retries = tpl->max_retries;
+
+	/* Retry policy, not the per-connection retry state (previous_backoff). */
+	dst->backoff.algorithm = tpl->backoff.algorithm;
+	dst->backoff.base = tpl->backoff.base;
+	dst->backoff.cap = tpl->backoff.cap;
+
+	if (dst->prefix != NULL) {
+		zend_string_release(dst->prefix);
+		dst->prefix = NULL;
+	}
+
+	if (tpl->prefix != NULL) {
+		dst->prefix = zend_string_copy(tpl->prefix);
+	}
+
+	dst->read_timeout = tpl->read_timeout;
+	dst->tcp_keepalive = tpl->tcp_keepalive;
+}
+
+/* Push the stream-level options onto an open socket. A fresh connection gets
+ * them from redis_sock_connect() instead. */
+static void redis_pool_apply_live_opts(RedisSock *sock)
+{
+	if (sock->stream == NULL) {
+		return;
+	}
+
+	struct timeval read_tv;
+	read_tv.tv_sec = (time_t)sock->read_timeout;
+	read_tv.tv_usec = (int)((sock->read_timeout - read_tv.tv_sec) * 1000000);
+
+	/* 0 means no timeout: never arm a zero deadline. */
+	if (read_tv.tv_sec != 0 || read_tv.tv_usec != 0) {
+		php_stream_set_option(sock->stream, PHP_STREAM_OPTION_READ_TIMEOUT, 0, &read_tv);
+	}
+
+	int keepalive = sock->tcp_keepalive ? 1 : 0;
+	php_netstream_data_t *net = (php_netstream_data_t *)sock->stream->abstract;
+	setsockopt(net->socket, SOL_SOCKET, SO_KEEPALIVE, (char *)&keepalive, sizeof(keepalive));
+}
+
+/* Bring a pooled connection up to the template's current option generation. */
+static zend_always_inline void redis_pool_sync_opts(const redis_async_pool *rp, RedisSock *sock)
+{
+	if (EXPECTED(sock == NULL || sock->opt_gen == rp->opt_gen)) {
+		return;
+	}
+
+	redis_pool_copy_opts(rp->template_sock, sock);
+	redis_pool_apply_live_opts(sock);
+	sock->opt_gen = rp->opt_gen;
+}
 
 /* Stable hash key for the current coroutine (zend_object handle when available,
  * pointer otherwise). Mirrors the PDO pool key derivation. */
@@ -303,6 +374,10 @@ static RedisSock *redis_pool_connect(const redis_async_pool *rp)
 		redis_pool_free_conn(sock);
 		return NULL;
 	}
+
+	/* Before connecting: read timeout and keepalive are applied at connect time. */
+	redis_pool_copy_opts(rp->template_sock, sock);
+	sock->opt_gen = rp->opt_gen;
 
 	sock->persistent = 0;
 
@@ -650,6 +725,10 @@ void redis_mux_dispatch(redis_object *redis, char *cmd, int cmd_len,
 		RETURN_FALSE;
 	}
 
+	/* The command was built with the template's options, the reply is parsed with
+	 * the lane's: both must be on the same generation. */
+	redis_pool_sync_opts(rp, lane->sock);
+
 	/* The future's single ref belongs to the waiter; the pump releases it after
 	 * delivering or discarding the reply (or pool destroy does, for a dead lane).
 	 * resume_when borrows it for the await. */
@@ -875,6 +954,7 @@ int redis_pool_create(redis_object *redis, HashTable *opts)
 
 	rp->opts = zend_array_dup(opts);
 	rp->db_default = redis->sock ? redis->sock->dbNumber : 0;
+	rp->template_sock = redis->sock;
 	redis->pool = rp;
 
 	/* Pre-open all multiplex lanes here, in the constructor — the one place a
@@ -970,6 +1050,7 @@ RedisSock *redis_pool_acquire_conn(redis_object *redis, int no_throw)
 	if (binding != NULL) {
 		/* Reuse the connection already checked out for this coroutine. */
 		if (EXPECTED(binding->conn != NULL)) {
+			redis_pool_sync_opts(rp, binding->conn);
 			return binding->conn;
 		}
 
@@ -982,6 +1063,8 @@ RedisSock *redis_pool_acquire_conn(redis_object *redis, int no_throw)
 		}
 
 		binding->conn = Z_PTR(resource);
+		redis_pool_sync_opts(rp, binding->conn);
+
 		return binding->conn;
 	}
 
@@ -1010,7 +1093,21 @@ RedisSock *redis_pool_acquire_conn(redis_object *redis, int no_throw)
 		binding->has_coro_callback = true;
 	}
 
+	redis_pool_sync_opts(rp, binding->conn);
+
 	return binding->conn;
+}
+
+void redis_pool_options_changed(redis_object *redis)
+{
+	redis_async_pool *rp = redis->pool;
+
+	if (rp == NULL) {
+		return;
+	}
+
+	/* Checkout connections re-sync on acquire, lanes on dispatch. */
+	rp->opt_gen++;
 }
 
 void redis_pool_maybe_release(zval *id)

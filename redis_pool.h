@@ -22,6 +22,10 @@ int redis_pool_create(redis_object *redis, HashTable *opts);
 /* Tear down the pool: release active conns, detach bindings, close async pool. */
 void redis_pool_destroy(redis_object *redis);
 
+/* Record that setOption() mutated the template socket: connections re-sync on
+ * their next acquire, mux lanes on their next dispatch. No-op without a pool. */
+void redis_pool_options_changed(redis_object *redis);
+
 /* Lazily create and cache the PHP pool wrapper object (Async\Pool) for
  * Redis::getPool(). Returns NULL when the object has no pool. The returned
  * object is owned by the pool (released on destroy); callers that hand it to

@@ -341,6 +341,7 @@ typedef struct {
     size_t              txBytes;
     size_t              rxBytes;
     uint8_t             flags;
+    uint32_t            opt_gen;     /* pool: template option generation this conn carries */
 } RedisSock;
 /* }}} */
 

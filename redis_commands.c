@@ -7692,8 +7692,10 @@ void redis_setoption_handler(INTERNAL_FUNCTION_PARAMETERS,
                             sizeof(tcp_keepalive)) == -1) {
                     RETURN_FALSE;
                 }
-                redis_sock->tcp_keepalive = tcp_keepalive;
             }
+
+            /* Also without a stream: redis_sock_connect() applies it on open. */
+            redis_sock->tcp_keepalive = tcp_keepalive;
             RETURN_TRUE;
         case REDIS_OPT_SCAN:
             val_long = zval_get_long(val);

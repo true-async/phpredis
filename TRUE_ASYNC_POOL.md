@@ -250,7 +250,15 @@ binding.
 
 Only server session state leaks between borrowers: `SELECT`, `WATCH`, `MULTI`,
 `SUBSCRIBE`, `CLIENT SETNAME/TRACKING`. Client-side config (serializer, prefix,
-compression) is identical on every connection (set by the factory) — no leak.
+compression) is identical on every connection — no leak.
+
+Client-side config lives on the template socket, because `setOption()` writes to
+the object's own `RedisSock` and that one is never opened in pool mode. The pool
+copies it onto every connection it opens, and a later `setOption()` bumps a
+generation counter so live connections re-sync on their next acquire (lanes: on
+their next dispatch). Without this a pooled connection would run with phpredis
+defaults while commands were built with the template's — silent serializer and
+prefix mismatches.
 
 v1 rule: the factory applies `db_default`; a runtime `SELECT` to another DB pins
 the connection (predicate §4.2), so it is never returned to the shared pool
@@ -523,8 +531,9 @@ pool, released on destroy.
 Chaos-style invariants (true under any interleaving — count attempts/successes,
 not exact values).
 
-Current: 001–007 all pass — construct introspection, single, concurrent,
-backpressure, transaction pin, concurrent-MULTI isolation, getPool introspection.
+Current: 001–009 and 101–110 all pass — construct introspection, single,
+concurrent, backpressure, transaction pin, concurrent-MULTI isolation, getPool
+introspection, ctor host, option inheritance; and the mux set.
 
 Planned Stage 2: mux many GET over one socket, reply ordering under interleaving,
 fallback for MULTI/SUB/BLPOP, broken mux socket, implicit pipelining.
